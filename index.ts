@@ -27,24 +27,17 @@
  *    array). Claude Sonnet 5 lacks mid-conversation support, so it is skipped.
  * Other provider shapes are skipped untouched.
  *
- * Subagent exclusion: pi-subagents spawns child pi processes that auto-discover
- * this global extension (no --no-extensions by default) and set
- * PI_SUBAGENT_CHILD=1 (pi-args.ts:338). In child processes this extension:
- *  1) skips tail injection (before_provider_request guard), and
- *  2) strips the SYSTEM.md Behavior Contract from the system prompt
- *     (before_agent_start) — SYSTEM.md is loaded unconditionally by pi
- *     core (resource-loader discoverSystemPromptFile) with no CLI switch
- *     to disable it, and its orchestrator identity contradicts the subagent's
- *     to disable it, and its orchestrator identity contradicts the subagent's
- *     implementer role. Both layers stay paired: the main session gets them,
- *     subagents get neither.
+ * Child sessions (PI_SUBAGENT_CHILD): before_agent_start splices only the
+ * SYSTEM.md Role chapter (heading + following --- + next heading must be
+ * # Namespace Registry). Replace-mode inserts the entire spliced contract.
+ * Locator failure aborts the child start. Tail injection uses
+ * profiles.subagent.applyment; a missing subagent profile injects nothing.
  *
  * Configuration: ~/.pi/agent/tail-prompt.yaml
- *   role: system | user        # injected message role (default: system)
- *   imports:                   # name -> relative path (resolved under ~/.pi/agent)
- *     name: system-prompts/xxx.txt
- *   applyment:                 # ordered list of imported names to inject
- *     - name
+ *   role: system | user
+ *   imports: name -> relative path (resolved under ~/.pi/agent)
+ *   applyment: parent session class list
+ *   profiles.subagent.applyment: child session class list
  *
  * The injected content is assembled once per config change (mtime check). The
  * selfref/role-anchor blocks declare that this text is a reminder, not an
@@ -58,36 +51,84 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 const CONFIG_DIR = path.join(process.env.HOME || "", ".pi", "agent");
 const CONFIG_PATH = path.join(CONFIG_DIR, "tail-prompt.yaml");
 const SYSTEM_PATH = path.join(CONFIG_DIR, "SYSTEM.md");
+const CHILD_ROLE_PATH = path.join(
+	CONFIG_DIR,
+	"system-prompts",
+	"child-role.md",
+);
+const ROLE_HEADING = "## Role and Capability";
+const ROLE_FENCE = "---";
+const AFTER_ROLE_HEADING = "# Namespace Registry";
+const CHILD_BOUNDARY_PREFIX = "You are a child subagent";
 
 interface TailConfig {
 	role: "system" | "user";
-	prompts: string[]; // ordered, assembled content blocks
+	prompts: string[];
 }
 
-/** Minimal YAML-subset parser for the fixed config shape. */
-function parseConfig(raw: string): {
+export type SessionClass = "main" | "subagent";
+
+export type ParsedTailYaml = {
 	role: "system" | "user";
 	imports: Record<string, string>;
 	applyment: string[];
-} {
+	subagentApplyment: string[] | undefined;
+};
+
+export type RoleSpan = { start: number; end: number };
+
+export function sessionClass(
+	env: NodeJS.ProcessEnv = process.env,
+): SessionClass {
+	return env.PI_SUBAGENT_CHILD ? "subagent" : "main";
+}
+
+/** Minimal YAML-subset parser for role, imports, applyment, and profiles.subagent.applyment. */
+export function parseConfig(raw: string): ParsedTailYaml {
 	const role: "system" | "user" =
 		raw.match(/^role:\s*(\S+)/m)?.[1] === "user" ? "user" : "system";
 	const imports: Record<string, string> = {};
 	const applyment: string[] = [];
-	let section: "imports" | "applyment" | null = null;
+	let subagentApplyment: string[] | undefined;
+	let section: "imports" | "applyment" | "subagent-applyment" | null = null;
+	let inProfiles = false;
+	let inSubagent = false;
 	for (const line of raw.split("\n")) {
+		const indent = line.match(/^(\s*)/)?.[1].length ?? 0;
 		const t = line.trim();
 		if (!t || t.startsWith("#")) continue;
-		if (t === "imports:") {
-			section = "imports";
-			continue;
-		}
-		if (t === "applyment:") {
-			section = "applyment";
-			continue;
-		}
-		if (/^[a-zA-Z0-9_-]+:\s*$/.test(t)) {
+		if (indent === 0) {
+			inProfiles = false;
+			inSubagent = false;
+			if (t === "imports:") {
+				section = "imports";
+				continue;
+			}
+			if (t === "applyment:") {
+				section = "applyment";
+				continue;
+			}
+			if (t === "profiles:") {
+				section = null;
+				inProfiles = true;
+				continue;
+			}
 			section = null;
+			continue;
+		}
+		if (
+			inProfiles &&
+			indent > 0 &&
+			t !== "applyment:" &&
+			/^[a-zA-Z0-9_-]+:\s*$/.test(t)
+		) {
+			inSubagent = t === "subagent:";
+			section = null;
+			continue;
+		}
+		if (inSubagent && t === "applyment:") {
+			section = "subagent-applyment";
+			subagentApplyment = [];
 			continue;
 		}
 		if (section === "imports") {
@@ -96,39 +137,145 @@ function parseConfig(raw: string): {
 		} else if (section === "applyment") {
 			const m = t.match(/^-\s*(.+)$/);
 			if (m) applyment.push(m[1].trim());
+		} else if (section === "subagent-applyment") {
+			const m = t.match(/^-\s*(.+)$/);
+			if (m) subagentApplyment?.push(m[1].trim());
 		}
 	}
-	return { role, imports, applyment };
+	return { role, imports, applyment, subagentApplyment };
 }
 
-function loadConfig(): TailConfig | null {
-	try {
-		if (!fs.existsSync(CONFIG_PATH)) return null;
-		const raw = fs.readFileSync(CONFIG_PATH, "utf-8");
-		const { role, imports, applyment } = parseConfig(raw);
-		const prompts: string[] = [];
-		for (const name of applyment) {
-			const rel = imports[name];
-			if (!rel) continue;
-			const p = path.join(CONFIG_DIR, rel);
-			if (!fs.existsSync(p)) continue;
-			prompts.push(fs.readFileSync(p, "utf-8").trim());
-		}
-		if (prompts.length === 0) return null;
-		return { role, prompts };
-	} catch (error) {
-		console.warn(`tail-prompt: config load failed: ${error}`);
-		return null;
+/** Null means no injection for that session class (fail closed for missing child profile). */
+export function applymentForSession(
+	parsed: ParsedTailYaml,
+	session: SessionClass,
+): string[] | null {
+	if (session === "subagent") {
+		if (parsed.subagentApplyment === undefined) return null;
+		return parsed.subagentApplyment.length > 0 ? parsed.subagentApplyment : null;
 	}
+	return parsed.applyment.length > 0 ? parsed.applyment : null;
+}
+
+export function resolveImportPath(
+	rel: string,
+	configDir: string,
+): string | null {
+	if (!rel) return null;
+	const root = path.resolve(configDir);
+	const resolved = path.resolve(root, rel);
+	const prefix = root.endsWith(path.sep) ? root : `${root}${path.sep}`;
+	if (resolved !== root && !resolved.startsWith(prefix)) return null;
+	return resolved;
+}
+
+export function loadPrompts(
+	names: string[],
+	imports: Record<string, string>,
+	configDir: string = CONFIG_DIR,
+): string[] | null {
+	const prompts: string[] = [];
+	for (const name of names) {
+		const rel = imports[name];
+		if (!rel) return null;
+		const p = resolveImportPath(rel, configDir);
+		if (!p || !fs.existsSync(p)) return null;
+		prompts.push(fs.readFileSync(p, "utf-8").trim());
+	}
+	return prompts;
+}
+function lineStartOffset(text: string, lineIndex: number): number {
+	if (lineIndex === 0) return 0;
+	let seen = 0;
+	for (let i = 0; i < text.length; i++) {
+		if (text[i] === "\n") {
+			seen++;
+			if (seen === lineIndex) return i + 1;
+		}
+	}
+	return text.length;
 }
 
 /**
- * Insert the tail prompt immediately before the latest user message.
- *
- * Mutates the given payload messages array in place (matching the hook's
- * handling). Returns the array, or null when no user message exists — the
- * caller then leaves the payload untouched.
+ * Role chapter is heading through the following `---` line only when the next
+ * ATX heading is `# Namespace Registry`.
  */
+export function locateRoleChapter(text: string): RoleSpan | null {
+	const lines = text.split("\n");
+	const startLine = lines.indexOf(ROLE_HEADING);
+	if (startLine === -1) return null;
+	let fenceLine = -1;
+	for (let i = startLine + 1; i < lines.length; i++) {
+		if (lines[i] === ROLE_FENCE) {
+			fenceLine = i;
+			break;
+		}
+	}
+	if (fenceLine === -1) return null;
+	let nextHeading = "";
+	for (let i = fenceLine + 1; i < lines.length; i++) {
+		if (lines[i].startsWith("#")) {
+			nextHeading = lines[i];
+			break;
+		}
+	}
+	if (nextHeading !== AFTER_ROLE_HEADING) return null;
+	const start = lineStartOffset(text, startLine);
+	let end = lineStartOffset(text, fenceLine) + lines[fenceLine].length;
+	if (text[end] === "\n") end += 1;
+	return { start, end };
+}
+
+function replaceSpan(
+	text: string,
+	span: RoleSpan,
+	replacement: string,
+): string {
+	const body = replacement.endsWith("\n") ? replacement : `${replacement}\n`;
+	return `${text.slice(0, span.start)}${body}${text.slice(span.end)}`;
+}
+
+export function insertAfterChildBoundary(
+	prompt: string,
+	contract: string,
+): string {
+	const block = contract.trimEnd();
+	if (!prompt.startsWith(CHILD_BOUNDARY_PREFIX)) {
+		return prompt.length === 0 ? `${block}\n` : `${block}\n\n${prompt}`;
+	}
+	const sep = prompt.indexOf("\n\n");
+	if (sep === -1) return `${prompt}\n\n${block}\n`;
+	return `${prompt.slice(0, sep)}\n\n${block}\n\n${prompt.slice(sep + 2)}`;
+}
+
+/**
+ * Child system-prompt splice. Throws if SYSTEM.md Role locator fails.
+ * Append path: Role chapter present with valid locator → replace that span.
+ * Replace path: no locatable Role chapter → insert entire spliced SYSTEM.md.
+ */
+export function applyChildSystemPrompt(
+	prompt: string,
+	systemMd: string,
+	childRole: string,
+): string {
+	const diskSpan = locateRoleChapter(systemMd);
+	if (!diskSpan) {
+		throw new Error(
+			"tail-prompt: Role chapter locator failed in SYSTEM.md (need ## Role and Capability, ---, then # Namespace Registry)",
+		);
+	}
+	const childChapter = childRole.trimEnd();
+	const splicedContract = replaceSpan(systemMd, diskSpan, childChapter);
+	const promptSpan = locateRoleChapter(prompt);
+	if (promptSpan) {
+		const current = prompt.slice(promptSpan.start, promptSpan.end).trim();
+		if (current === childChapter.trim()) return prompt;
+		return replaceSpan(prompt, promptSpan, childChapter);
+	}
+	if (prompt.includes(childChapter.trim())) return prompt;
+	return insertAfterChildBoundary(prompt, splicedContract);
+}
+
 /**
  * Index of the latest user-role message, or -1 when none exists. Guarded
  * against null/undefined array elements.
@@ -219,15 +366,14 @@ export function applyTailToPayload(
 		// Claude Sonnet 5 does not support mid-conversation system messages; skip.
 		if (isSonnet5(String(payload.model ?? ""))) return undefined;
 		if (!injectAnthropicTail(arr, content)) return undefined;
-	} else {
-		if (!injectTailPrompt(arr, content, role)) return undefined;
-	}
+	} else if (!injectTailPrompt(arr, content, role)) return undefined;
 	return payload;
 }
-export default function (pi: ExtensionAPI) {
-	let cache: { config: TailConfig | null; key: string } | null = null;
 
-	const getConfig = (): TailConfig | null => {
+export default function (pi: ExtensionAPI) {
+	let cache: { parsed: ParsedTailYaml | null; key: string } | null = null;
+
+	const getParsed = (): ParsedTailYaml | null => {
 		let mtimeMs = 0;
 		let size = -1;
 		try {
@@ -239,35 +385,51 @@ export default function (pi: ExtensionAPI) {
 		}
 		const key = `${mtimeMs}:${size}`;
 		if (!cache || cache.key !== key) {
-			cache = { config: loadConfig(), key };
+			let parsed: ParsedTailYaml | null = null;
+			try {
+				if (fs.existsSync(CONFIG_PATH)) {
+					parsed = parseConfig(fs.readFileSync(CONFIG_PATH, "utf-8"));
+				}
+			} catch (error) {
+				console.warn(`tail-prompt: config load failed: ${error}`);
+			}
+			cache = { parsed, key };
 		}
-		return cache.config;
+		return cache.parsed;
+	};
+
+	const getConfig = (): TailConfig | null => {
+		const parsed = getParsed();
+		if (!parsed) return null;
+		const names = applymentForSession(parsed, sessionClass());
+		if (!names) return null;
+		const prompts = loadPrompts(names, parsed.imports);
+		if (!prompts) return null;
+		return { role: parsed.role, prompts };
 	};
 
 	pi.on("before_agent_start", (event) => {
-		if (!process.env.PI_SUBAGENT_CHILD) return; // main session: keep Behavior Contract
-		let appendContent: string;
+		if (sessionClass() !== "subagent") return;
+		let systemMd: string;
+		let childRole: string;
 		try {
-			appendContent = fs.readFileSync(SYSTEM_PATH, "utf-8").trim();
-		} catch {
-			return; // no SYSTEM.md to strip
+			systemMd = fs.readFileSync(SYSTEM_PATH, "utf-8");
+			childRole = fs.readFileSync(CHILD_ROLE_PATH, "utf-8");
+		} catch (error) {
+			throw new Error(
+				`tail-prompt: child Role splice requires SYSTEM.md and child-role.md: ${error}`,
+			);
 		}
-		if (!appendContent || !event.systemPrompt.includes(appendContent)) return; // fail-safe: no match, leave as-is
-		return {
-			systemPrompt: event.systemPrompt.replace(appendContent, ""),
-		};
+		const next = applyChildSystemPrompt(event.systemPrompt, systemMd, childRole);
+		if (next === event.systemPrompt) return;
+		return { systemPrompt: next };
 	});
 
 	pi.on("before_provider_request", (event) => {
-		if (process.env.PI_SUBAGENT_CHILD) return; // subagent processes: no tail injection
 		const config = getConfig();
 		if (!config) return;
 		const payload = event.payload as Record<string, unknown> | undefined;
 		if (!payload) return;
-		return applyTailToPayload(
-			payload,
-			config.prompts.join("\n\n"),
-			config.role,
-		);
+		return applyTailToPayload(payload, config.prompts.join("\n\n"), config.role);
 	});
 }

@@ -1,3 +1,6 @@
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { describe, expect, test } from "bun:test";
 import {
 	injectTailPrompt,
@@ -5,6 +8,12 @@ import {
 	applyTailToPayload,
 	isAnthropicPayload,
 	isSonnet5,
+	parseConfig,
+	applymentForSession,
+	locateRoleChapter,
+	applyChildSystemPrompt,
+	resolveImportPath,
+	loadPrompts,
 } from "./index.ts";
 
 const system = { role: "system", content: "s" };
@@ -295,5 +304,173 @@ describe("isSonnet5", () => {
 		expect(isSonnet5("claude-sonnet-4-5")).toBe(false); // not Sonnet 5
 		expect(isSonnet5("claude-sonnet-4-6")).toBe(false);
 		expect(isSonnet5("claude-opus-4-8")).toBe(false);
+	});
+});
+
+describe("parseConfig profiles", () => {
+	const yaml = [
+		"role: system",
+		"imports:",
+		"  decompose: system-prompts/decompose-thinking.txt",
+		"  contract: system-prompts/working-contract.txt",
+		"  child-contract: system-prompts/child-working-contract.txt",
+		"applyment:",
+		"  - decompose",
+		"  - contract",
+		"profiles:",
+		"  subagent:",
+		"    applyment:",
+		"      - decompose",
+		"      - child-contract",
+		"",
+	].join("\n");
+
+	test("parent applyment stays decompose then contract", () => {
+		const parsed = parseConfig(yaml);
+		expect(applymentForSession(parsed, "main")).toEqual([
+			"decompose",
+			"contract",
+		]);
+	});
+
+	test("subagent applyment is decompose then child-contract", () => {
+		const parsed = parseConfig(yaml);
+		expect(applymentForSession(parsed, "subagent")).toEqual([
+			"decompose",
+			"child-contract",
+		]);
+	});
+
+	test("missing subagent profile fails closed", () => {
+		const parsed = parseConfig("role: system\napplyment:\n  - decompose\n");
+		expect(applymentForSession(parsed, "subagent")).toBeNull();
+		expect(applymentForSession(parsed, "main")).toEqual(["decompose"]);
+	});
+
+	test("sibling profile applyment does not overwrite subagent applyment", () => {
+		const parsed = parseConfig(
+			[
+				"role: system",
+				"imports:",
+				"  decompose: system-prompts/decompose-thinking.txt",
+				"  contract: system-prompts/working-contract.txt",
+				"  child-contract: system-prompts/child-working-contract.txt",
+				"applyment:",
+				"  - decompose",
+				"profiles:",
+				"  subagent:",
+				"    applyment:",
+				"      - decompose",
+				"      - child-contract",
+				"  main:",
+				"    applyment:",
+				"      - contract",
+				"",
+			].join("\n"),
+		);
+		expect(applymentForSession(parsed, "subagent")).toEqual([
+			"decompose",
+			"child-contract",
+		]);
+	});
+});
+
+describe("import path and prompt load", () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "tail-prompt-"));
+
+	test("resolveImportPath keeps paths under config dir", () => {
+		const inside = resolveImportPath("system-prompts/a.txt", root);
+		expect(inside).toBe(path.resolve(root, "system-prompts/a.txt"));
+	});
+
+	test("resolveImportPath rejects escape (absolute or ..)", () => {
+		expect(resolveImportPath("/etc/passwd", root)).toBeNull();
+		expect(resolveImportPath("../secret", root)).toBeNull();
+		expect(resolveImportPath("foo/../../outside", root)).toBeNull();
+	});
+
+	test("loadPrompts fails closed when any applyment name is missing", () => {
+		fs.mkdirSync(path.join(root, "prompts"));
+		fs.writeFileSync(path.join(root, "prompts", "a.txt"), "A\n");
+		const imports = {
+			a: "prompts/a.txt",
+			b: "prompts/missing.txt",
+		};
+		expect(loadPrompts(["a", "b"], imports, root)).toBeNull();
+		expect(loadPrompts(["a"], imports, root)).toEqual(["A"]);
+	});
+});
+
+describe("Role chapter splice", () => {
+	const parentRole = [
+		"## Role and Capability",
+		"",
+		"**Role**:",
+		"I am an orchestrator, not an implementer.",
+		"",
+		"---",
+	].join("\n");
+	const childRole = [
+		"## Role and Capability",
+		"",
+		"**Role**:",
+		"I am a child subagent.",
+		"",
+		"---",
+	].join("\n");
+	const systemMd = `Preamble\n\n${parentRole}\n\n# Namespace Registry\n\nrest\n`;
+
+	test("locator requires heading, fence, and Namespace Registry", () => {
+		const span = locateRoleChapter(systemMd);
+		expect(span).not.toBeNull();
+		expect(systemMd.slice(span!.start, span!.end).trim()).toBe(parentRole);
+		expect(locateRoleChapter(`${parentRole}\n\n# Other\n`)).toBeNull();
+		expect(locateRoleChapter("no role here\n# Namespace Registry\n")).toBeNull();
+	});
+
+	test("append-mode replaces only the Role span", () => {
+		const out = applyChildSystemPrompt(systemMd, systemMd, childRole);
+		expect(out).toContain("I am a child subagent.");
+		expect(out).not.toContain("I am an orchestrator, not an implementer.");
+		expect(out).toContain("# Namespace Registry");
+		expect(out).toContain("Preamble");
+		expect(out).toContain("rest");
+	});
+
+	test("replace-mode inserts the entire spliced SYSTEM.md", () => {
+		const agentBody = "You are worker.\n\nDo the task.\n";
+		const out = applyChildSystemPrompt(agentBody, systemMd, childRole);
+		expect(
+			out.startsWith("## Role and Capability") || out.includes("Preamble"),
+		).toBe(true);
+		expect(out).toContain("Preamble");
+		expect(out).toContain("# Namespace Registry");
+		expect(out).toContain("You are worker.");
+		expect(out).toContain("I am a child subagent.");
+		expect(out).not.toContain("I am an orchestrator, not an implementer.");
+		const roleCount = out.split("## Role and Capability").length - 1;
+		expect(roleCount).toBe(1);
+	});
+
+	test("replace-mode inserts after child boundary when present", () => {
+		const boundary =
+			"You are a child subagent, not the parent orchestrator.\nStay in role.\n\nYou are worker.\n";
+		const out = applyChildSystemPrompt(boundary, systemMd, childRole);
+		expect(out.startsWith("You are a child subagent")).toBe(true);
+		const boundaryAt = out.indexOf("You are a child subagent");
+		const contractAt = out.indexOf("Preamble");
+		expect(contractAt).toBeGreaterThan(boundaryAt);
+		expect(out).toContain("You are worker.");
+	});
+
+	test("idempotent when Role already matches child-role", () => {
+		const already = applyChildSystemPrompt(systemMd, systemMd, childRole);
+		expect(applyChildSystemPrompt(already, systemMd, childRole)).toBe(already);
+	});
+
+	test("throws when SYSTEM.md locator fails", () => {
+		expect(() =>
+			applyChildSystemPrompt("agent", "no role chapter\n", childRole),
+		).toThrow(/Role chapter locator failed/);
 	});
 });
