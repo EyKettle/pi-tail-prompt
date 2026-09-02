@@ -11,9 +11,11 @@ import {
 	parseConfig,
 	applymentForSession,
 	locateRoleChapter,
+	locateClosingIdentity,
 	applyChildSystemPrompt,
 	resolveImportPath,
 	loadPrompts,
+	sessionClass,
 } from "./index.ts";
 
 const system = { role: "system", content: "s" };
@@ -241,6 +243,64 @@ describe("applyTailToPayload (hook routing)", () => {
 			),
 		).toBeUndefined();
 	});
+
+	test("Responses input: injects before the latest user message", () => {
+		const payload = {
+			model: "grok-4.6",
+			input: [
+				{ role: "developer", content: "s" },
+				{ role: "user", content: "u1" },
+				{ role: "assistant", content: "a" },
+				{ role: "user", content: "u2" },
+			],
+		};
+		const out = applyTailToPayload(
+			payload as unknown as Record<string, unknown>,
+			"REMIND",
+			"system",
+		);
+		expect(out).toBe(payload);
+		const input = payload.input as Array<Record<string, unknown>>;
+		expect(input.map((m) => m.role)).toEqual([
+			"developer",
+			"user",
+			"assistant",
+			"system",
+			"user",
+		]);
+		expect(input[3]).toEqual({ role: "system", content: "REMIND" });
+	});
+
+	test("Responses input without a user message: returns undefined, untouched", () => {
+		const payload = {
+			model: "grok-4.6",
+			input: [{ role: "developer", content: "s" }],
+		};
+		const snapshot = JSON.stringify(payload);
+		expect(
+			applyTailToPayload(
+				payload as unknown as Record<string, unknown>,
+				"REMIND",
+				"system",
+			),
+		).toBeUndefined();
+		expect(JSON.stringify(payload)).toBe(snapshot);
+	});
+
+	test("messages present: Chat path wins over input", () => {
+		const payload = {
+			model: "gpt-5",
+			messages: [{ role: "user", content: "u1" }],
+			input: [{ role: "user", content: "other" }],
+		};
+		applyTailToPayload(
+			payload as unknown as Record<string, unknown>,
+			"REMIND",
+			"system",
+		);
+		expect(payload.messages.map((m) => m.role)).toEqual(["system", "user"]);
+		expect(payload.input.map((m) => m.role)).toEqual(["user"]);
+	});
 });
 
 describe("idempotence guards", () => {
@@ -401,7 +461,7 @@ describe("import path and prompt load", () => {
 	});
 });
 
-describe("Role chapter splice", () => {
+describe("Identity unit splice", () => {
 	const parentRole = [
 		"## Role and Capability",
 		"",
@@ -418,9 +478,52 @@ describe("Role chapter splice", () => {
 		"",
 		"---",
 	].join("\n");
-	const systemMd = `Preamble\n\n${parentRole}\n\n# Namespace Registry\n\nrest\n`;
+	const parentClosing = [
+		"**This agent is an orchestrator, not an implementer.**",
+		"",
+		"Delegate significant implementation (HB#1).",
+		"",
+		"The full constraint set is in the sections above.",
+		"",
+		"_(End of SOUL)_",
+	].join("\n");
+	const childClosing = [
+		"**This agent is a child subagent.**",
+		"",
+		"Complete the assigned task inside AUTHORIZATION.",
+		"",
+		"The full constraint set is in the sections above.",
+		"",
+		"_(End of SOUL)_",
+	].join("\n");
+	const systemMd = [
+		"Preamble",
+		"",
+		parentRole,
+		"",
+		"# Namespace Registry",
+		"",
+		"## Delegation & Orchestration",
+		"",
+		"HB#7",
+		"",
+		parentClosing,
+		"",
+	].join("\n");
 
-	test("locator requires heading, fence, and Namespace Registry", () => {
+	function expectChildIdentity(out: string) {
+		expect(out).toContain("I am a child subagent.");
+		expect(out).toContain("**This agent is a child subagent.**");
+		expect(out).not.toContain("I am an orchestrator, not an implementer.");
+		expect(out).not.toContain(
+			"This agent is an orchestrator, not an implementer.",
+		);
+		expect(out).toContain("# Namespace Registry");
+		expect(out).toContain("HB#7");
+		expect(out).toContain("## Delegation & Orchestration");
+	}
+
+	test("Role locator requires heading, fence, and Namespace Registry", () => {
 		const span = locateRoleChapter(systemMd);
 		expect(span).not.toBeNull();
 		expect(systemMd.slice(span!.start, span!.end).trim()).toBe(parentRole);
@@ -428,26 +531,73 @@ describe("Role chapter splice", () => {
 		expect(locateRoleChapter("no role here\n# Namespace Registry\n")).toBeNull();
 	});
 
-	test("append-mode replaces only the Role span", () => {
-		const out = applyChildSystemPrompt(systemMd, systemMd, childRole);
-		expect(out).toContain("I am a child subagent.");
-		expect(out).not.toContain("I am an orchestrator, not an implementer.");
-		expect(out).toContain("# Namespace Registry");
+	test("closing locator spans the unique start line through End of SOUL", () => {
+		const span = locateClosingIdentity(systemMd);
+		expect(span).not.toBeNull();
+		const slice = systemMd.slice(span!.start, span!.end).trim();
+		expect(
+			slice.startsWith(
+				"**This agent is an orchestrator, not an implementer.**",
+			),
+		).toBe(true);
+		expect(slice.endsWith("_(End of SOUL)_")).toBe(true);
+		expect(
+			locateClosingIdentity(systemMd.replace("_(End of SOUL)_", "nope")),
+		).toBeNull();
+		expect(
+			locateClosingIdentity(
+				`${systemMd}\n**This agent is an orchestrator, not an implementer.**\n`,
+			),
+		).toBeNull();
+		expect(locateClosingIdentity(`${systemMd}\n_(End of SOUL)_\n`)).toBeNull();
+	});
+
+	test("closing locator is unique on disk SYSTEM.md", () => {
+		const disk = fs.readFileSync(
+			path.join(os.homedir(), ".pi", "agent", "SYSTEM.md"),
+			"utf-8",
+		);
+		const lines = disk.split("\n");
+		expect(
+			lines.filter(
+				(l) => l === "**This agent is an orchestrator, not an implementer.**",
+			),
+		).toHaveLength(1);
+		expect(lines.filter((l) => l === "_(End of SOUL)_")).toHaveLength(1);
+		const span = locateClosingIdentity(disk);
+		expect(span).not.toBeNull();
+		const slice = disk.slice(span!.start, span!.end);
+		expect(slice).toContain(
+			"**This agent is an orchestrator, not an implementer.**",
+		);
+		expect(slice.trimEnd().endsWith("_(End of SOUL)_")).toBe(true);
+	});
+
+	test("append-mode replaces Role and closing identity", () => {
+		const out = applyChildSystemPrompt(
+			systemMd,
+			systemMd,
+			childRole,
+			childClosing,
+		);
+		expectChildIdentity(out);
 		expect(out).toContain("Preamble");
-		expect(out).toContain("rest");
 	});
 
 	test("replace-mode inserts the entire spliced SYSTEM.md", () => {
 		const agentBody = "You are worker.\n\nDo the task.\n";
-		const out = applyChildSystemPrompt(agentBody, systemMd, childRole);
+		const out = applyChildSystemPrompt(
+			agentBody,
+			systemMd,
+			childRole,
+			childClosing,
+		);
 		expect(
 			out.startsWith("## Role and Capability") || out.includes("Preamble"),
 		).toBe(true);
 		expect(out).toContain("Preamble");
-		expect(out).toContain("# Namespace Registry");
 		expect(out).toContain("You are worker.");
-		expect(out).toContain("I am a child subagent.");
-		expect(out).not.toContain("I am an orchestrator, not an implementer.");
+		expectChildIdentity(out);
 		const roleCount = out.split("## Role and Capability").length - 1;
 		expect(roleCount).toBe(1);
 	});
@@ -455,22 +605,191 @@ describe("Role chapter splice", () => {
 	test("replace-mode inserts after child boundary when present", () => {
 		const boundary =
 			"You are a child subagent, not the parent orchestrator.\nStay in role.\n\nYou are worker.\n";
-		const out = applyChildSystemPrompt(boundary, systemMd, childRole);
+		const out = applyChildSystemPrompt(
+			boundary,
+			systemMd,
+			childRole,
+			childClosing,
+		);
 		expect(out.startsWith("You are a child subagent")).toBe(true);
 		const boundaryAt = out.indexOf("You are a child subagent");
 		const contractAt = out.indexOf("Preamble");
 		expect(contractAt).toBeGreaterThan(boundaryAt);
 		expect(out).toContain("You are worker.");
+		expectChildIdentity(out);
 	});
 
-	test("idempotent when Role already matches child-role", () => {
-		const already = applyChildSystemPrompt(systemMd, systemMd, childRole);
-		expect(applyChildSystemPrompt(already, systemMd, childRole)).toBe(already);
+	test("idempotent when both identity units already match child", () => {
+		const already = applyChildSystemPrompt(
+			systemMd,
+			systemMd,
+			childRole,
+			childClosing,
+		);
+		expect(
+			applyChildSystemPrompt(already, systemMd, childRole, childClosing),
+		).toBe(already);
 	});
 
-	test("throws when SYSTEM.md locator fails", () => {
+	test("does not skip closing splice when Role already matches child", () => {
+		const mixed = systemMd.replace(
+			"I am an orchestrator, not an implementer.",
+			"I am a child subagent.",
+		);
+		expect(mixed).toContain("I am a child subagent.");
+		expect(mixed).toContain(
+			"This agent is an orchestrator, not an implementer.",
+		);
+		const out = applyChildSystemPrompt(
+			mixed,
+			systemMd,
+			childRole,
+			childClosing,
+		);
+		expectChildIdentity(out);
+	});
+
+	test("throws when SYSTEM.md Role locator fails", () => {
 		expect(() =>
-			applyChildSystemPrompt("agent", "no role chapter\n", childRole),
+			applyChildSystemPrompt(
+				"agent",
+				"no role chapter\n",
+				childRole,
+				childClosing,
+			),
 		).toThrow(/Role chapter locator failed/);
+	});
+
+	test("throws when SYSTEM.md closing locator fails", () => {
+		const noClosing = `Preamble\n\n${parentRole}\n\n# Namespace Registry\n\nHB#7\n`;
+		expect(() =>
+			applyChildSystemPrompt("agent", noClosing, childRole, childClosing),
+		).toThrow(/closing identity locator failed/);
+	});
+
+	test("throws when parent identity remains after splice", () => {
+		const leftover = `${systemMd}\nI am an orchestrator, not an implementer.\n`;
+		expect(() =>
+			applyChildSystemPrompt(leftover, leftover, childRole, childClosing),
+		).toThrow(/parent identity/);
+	});
+
+	test("splices disk SYSTEM.md with published child identity files", () => {
+		const agentHome = path.join(os.homedir(), ".pi", "agent");
+		const disk = fs.readFileSync(path.join(agentHome, "SYSTEM.md"), "utf-8");
+		const publishedRole = fs.readFileSync(
+			path.join(agentHome, "system-prompts", "child-role.md"),
+			"utf-8",
+		);
+		const publishedClosing = fs.readFileSync(
+			path.join(agentHome, "system-prompts", "child-closing.md"),
+			"utf-8",
+		);
+		const out = applyChildSystemPrompt(
+			disk,
+			disk,
+			publishedRole,
+			publishedClosing,
+		);
+		expect(out).toContain("I am a child subagent.");
+		expect(out).toContain("This agent is a child subagent.");
+		expect(out).not.toContain("I am an orchestrator, not an implementer.");
+		expect(out).not.toContain(
+			"This agent is an orchestrator, not an implementer.",
+		);
+		expect(out).toContain("# Namespace Registry");
+		expect(out).toContain("HB#7");
+		expect(out).toContain("## Delegation & Orchestration");
+	});
+});
+
+describe("child applyment on Chat and Responses payloads", () => {
+	const yaml = [
+		"role: system",
+		"imports:",
+		"  decompose: system-prompts/decompose-thinking.txt",
+		"  contract: system-prompts/working-contract.txt",
+		"  child-contract: system-prompts/child-working-contract.txt",
+		"applyment:",
+		"  - decompose",
+		"  - contract",
+		"profiles:",
+		"  subagent:",
+		"    applyment:",
+		"      - decompose",
+		"      - child-contract",
+		"",
+	].join("\n");
+
+	test("sessionClass treats PI_SUBAGENT_CHILD as subagent", () => {
+		expect(sessionClass({ PI_SUBAGENT_CHILD: "1" })).toBe("subagent");
+		expect(sessionClass({})).toBe("main");
+	});
+
+	test("injects thinking-step and skill-load tags into messages and input", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "tail-prompt-child-"));
+		fs.mkdirSync(path.join(root, "system-prompts"));
+		fs.writeFileSync(
+			path.join(root, "system-prompts", "decompose-thinking.txt"),
+			'<instruction target="thinking-step" kind="any" type="analysis">think</instruction>\n',
+		);
+		fs.writeFileSync(
+			path.join(root, "system-prompts", "child-working-contract.txt"),
+			'<instruction target="skill-load" kind="any" type="action">load</instruction>\n',
+		);
+		const parsed = parseConfig(yaml);
+		const names = applymentForSession(
+			parsed,
+			sessionClass({ PI_SUBAGENT_CHILD: "1" }),
+		);
+		expect(names).toEqual(["decompose", "child-contract"]);
+		const prompts = loadPrompts(names!, parsed.imports, root);
+		expect(prompts).not.toBeNull();
+		const content = prompts!.join("\n\n");
+
+		const chatPayload = {
+			model: "gpt-5",
+			messages: [
+				{ role: "system", content: "s" },
+				{ role: "user", content: "u1" },
+			],
+		};
+		const inputPayload = {
+			model: "grok-4.6",
+			input: [
+				{ role: "developer", content: "s" },
+				{ role: "user", content: "u1" },
+			],
+		};
+
+		const chatOut = applyTailToPayload(
+			chatPayload as unknown as Record<string, unknown>,
+			content,
+			parsed.role,
+		);
+		const inputOut = applyTailToPayload(
+			inputPayload as unknown as Record<string, unknown>,
+			content,
+			parsed.role,
+		);
+		expect(chatOut).toBe(chatPayload);
+		expect(inputOut).toBe(inputPayload);
+
+		const chatInjected = chatPayload.messages.find((m) =>
+			String(m.content).includes("<instruction"),
+		);
+		const inputInjected = inputPayload.input.find((m) =>
+			String(m.content).includes("<instruction"),
+		);
+		expect(chatInjected).toBeDefined();
+		expect(inputInjected).toBeDefined();
+		expect(String(chatInjected!.content)).toContain(
+			'<instruction target="thinking-step"',
+		);
+		expect(String(chatInjected!.content)).toContain('target="skill-load"');
+		expect(String(inputInjected!.content)).toContain(
+			'<instruction target="thinking-step"',
+		);
+		expect(String(inputInjected!.content)).toContain('target="skill-load"');
 	});
 });

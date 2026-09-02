@@ -17,20 +17,24 @@
  * the final provider payload (verified 2026-08-03 — payload contained only
  * system + user). The `before_provider_request` hook operates on the final
  * payload and its return value replaces it, so injection there is guaranteed to
- * reach the provider. Two provider payload shapes are supported, both anchored
+ * reach the provider. Three provider payload shapes are supported, all anchored
  * to the latest user turn so the reminder stays in the tail-attention window:
- *  - OpenAI-compatible (payload.messages array, no top-level `system`): inject
- *    {role, content} immediately BEFORE the latest user message.
+ *  - OpenAI-compatible Chat (payload.messages array, no top-level `system`):
+ *    inject {role, content} immediately BEFORE the latest user message.
+ *  - OpenAI Responses (payload.input array when messages is absent): same
+ *    latest-user-before-insert rule as Chat.
  *  - Anthropic Messages API (top-level `system` + `max_tokens`): inject a
  *    {role:"system"} mid-conversation message immediately AFTER the latest user
  *    turn (Anthropic requires system to follow a user turn, not lead the
  *    array). Claude Sonnet 5 lacks mid-conversation support, so it is skipped.
  * Other provider shapes are skipped untouched.
  *
- * Child sessions (PI_SUBAGENT_CHILD): before_agent_start splices only the
- * SYSTEM.md Role chapter (heading + following --- + next heading must be
- * # Namespace Registry). Replace-mode inserts the entire spliced contract.
- * Locator failure aborts the child start. Tail injection uses
+ * Child sessions (PI_SUBAGENT_CHILD): before_agent_start splices the
+ * SYSTEM.md Role chapter and closing identity unit. Role: heading + following
+ * --- + next heading must be # Namespace Registry. Closing: unique line
+ * **This agent is an orchestrator, not an implementer.** through _(End of SOUL)_.
+ * Replace-mode inserts the entire spliced contract. Locator failure or leftover
+ * parent identity sentences abort the child start. Tail injection uses
  * profiles.subagent.applyment; a missing subagent profile injects nothing.
  *
  * Configuration: ~/.pi/agent/tail-prompt.yaml
@@ -56,9 +60,21 @@ const CHILD_ROLE_PATH = path.join(
 	"system-prompts",
 	"child-role.md",
 );
+const CHILD_CLOSING_PATH = path.join(
+	CONFIG_DIR,
+	"system-prompts",
+	"child-closing.md",
+);
 const ROLE_HEADING = "## Role and Capability";
 const ROLE_FENCE = "---";
 const AFTER_ROLE_HEADING = "# Namespace Registry";
+const CLOSING_START =
+	"**This agent is an orchestrator, not an implementer.**";
+const CLOSING_END = "_(End of SOUL)_";
+const PARENT_IDENTITY_SENTENCES = [
+	"I am an orchestrator, not an implementer.",
+	"This agent is an orchestrator, not an implementer.",
+] as const;
 const CHILD_BOUNDARY_PREFIX = "You are a child subagent";
 
 interface TailConfig {
@@ -226,6 +242,29 @@ export function locateRoleChapter(text: string): RoleSpan | null {
 	return { start, end };
 }
 
+function uniqueLineIndex(lines: string[], line: string): number {
+	const first = lines.indexOf(line);
+	if (first === -1) return -1;
+	if (lines.indexOf(line, first + 1) !== -1) return -1;
+	return first;
+}
+
+/**
+ * Closing identity is the unique start line through unique `_(End of SOUL)_`,
+ * inclusive.
+ */
+export function locateClosingIdentity(text: string): RoleSpan | null {
+	const lines = text.split("\n");
+	const startLine = uniqueLineIndex(lines, CLOSING_START);
+	if (startLine === -1) return null;
+	const endLine = uniqueLineIndex(lines, CLOSING_END);
+	if (endLine === -1 || endLine < startLine) return null;
+	const start = lineStartOffset(text, startLine);
+	let end = lineStartOffset(text, endLine) + lines[endLine].length;
+	if (text[end] === "\n") end += 1;
+	return { start, end };
+}
+
 function replaceSpan(
 	text: string,
 	span: RoleSpan,
@@ -233,6 +272,57 @@ function replaceSpan(
 ): string {
 	const body = replacement.endsWith("\n") ? replacement : `${replacement}\n`;
 	return `${text.slice(0, span.start)}${body}${text.slice(span.end)}`;
+}
+
+function assertNoParentIdentity(text: string): void {
+	for (const sentence of PARENT_IDENTITY_SENTENCES) {
+		if (text.includes(sentence)) {
+			throw new Error(
+				`tail-prompt: child SOUL still contains parent identity: ${sentence}`,
+			);
+		}
+	}
+}
+
+function spliceFoundIdentity(
+	text: string,
+	childRole: string,
+	childClosing: string,
+): string {
+	const roleSpan = locateRoleChapter(text);
+	const closingSpan = locateClosingIdentity(text);
+	const replacements: { span: RoleSpan; replacement: string }[] = [];
+	if (closingSpan) {
+		replacements.push({ span: closingSpan, replacement: childClosing });
+	}
+	if (roleSpan) {
+		replacements.push({ span: roleSpan, replacement: childRole });
+	}
+	replacements.sort((a, b) => b.span.start - a.span.start);
+	let result = text;
+	for (const item of replacements) {
+		result = replaceSpan(result, item.span, item.replacement);
+	}
+	assertNoParentIdentity(result);
+	return result;
+}
+
+function spliceDiskIdentity(
+	systemMd: string,
+	childRole: string,
+	childClosing: string,
+): string {
+	if (!locateRoleChapter(systemMd)) {
+		throw new Error(
+			"tail-prompt: Role chapter locator failed in SYSTEM.md (need ## Role and Capability, ---, then # Namespace Registry)",
+		);
+	}
+	if (!locateClosingIdentity(systemMd)) {
+		throw new Error(
+			"tail-prompt: closing identity locator failed in SYSTEM.md (need unique **This agent is an orchestrator, not an implementer.** through _(End of SOUL)_)",
+		);
+	}
+	return spliceFoundIdentity(systemMd, childRole, childClosing);
 }
 
 export function insertAfterChildBoundary(
@@ -249,31 +339,30 @@ export function insertAfterChildBoundary(
 }
 
 /**
- * Child system-prompt splice. Throws if SYSTEM.md Role locator fails.
- * Append path: Role chapter present with valid locator → replace that span.
- * Replace path: no locatable Role chapter → insert entire spliced SYSTEM.md.
+ * Child system-prompt splice. Throws if SYSTEM.md Role or closing locators
+ * fail, or if parent identity sentences remain after splice.
+ * Append path: Role chapter present with valid locator → replace Role and
+ * closing spans on the prompt. Replace path: no locatable Role chapter →
+ * insert entire spliced SYSTEM.md.
  */
 export function applyChildSystemPrompt(
 	prompt: string,
 	systemMd: string,
 	childRole: string,
+	childClosing: string,
 ): string {
-	const diskSpan = locateRoleChapter(systemMd);
-	if (!diskSpan) {
-		throw new Error(
-			"tail-prompt: Role chapter locator failed in SYSTEM.md (need ## Role and Capability, ---, then # Namespace Registry)",
-		);
+	const splicedContract = spliceDiskIdentity(
+		systemMd,
+		childRole,
+		childClosing,
+	);
+	const promptRole = locateRoleChapter(prompt);
+	if (promptRole || prompt.includes(childRole.trim())) {
+		return spliceFoundIdentity(prompt, childRole, childClosing);
 	}
-	const childChapter = childRole.trimEnd();
-	const splicedContract = replaceSpan(systemMd, diskSpan, childChapter);
-	const promptSpan = locateRoleChapter(prompt);
-	if (promptSpan) {
-		const current = prompt.slice(promptSpan.start, promptSpan.end).trim();
-		if (current === childChapter.trim()) return prompt;
-		return replaceSpan(prompt, promptSpan, childChapter);
-	}
-	if (prompt.includes(childChapter.trim())) return prompt;
-	return insertAfterChildBoundary(prompt, splicedContract);
+	const inserted = insertAfterChildBoundary(prompt, splicedContract);
+	assertNoParentIdentity(inserted);
+	return inserted;
 }
 
 /**
@@ -350,9 +439,9 @@ export function injectAnthropicTail(
  * Route a provider payload through the correct tail-injection adapter.
  *
  * Pure and hook-independent so the full routing (Anthropic dispatch, Sonnet 5
- * skip, OpenAI fallback) is unit-testable without a live event emitter.
- * Returns the (mutated) payload, or undefined when nothing should be sent
- * back as a replacement (the handler then leaves the payload untouched).
+ * skip, Chat messages, Responses input) is unit-testable without a live event
+ * emitter. Returns the (mutated) payload, or undefined when nothing should be
+ * sent back as a replacement (the handler then leaves the payload untouched).
  */
 export function applyTailToPayload(
 	payload: Record<string, unknown>,
@@ -360,14 +449,22 @@ export function applyTailToPayload(
 	role: "system" | "user",
 ): Record<string, unknown> | undefined {
 	const messages = payload.messages;
-	if (!Array.isArray(messages)) return undefined;
-	const arr = messages as Array<Record<string, unknown>>;
-	if (isAnthropicPayload(payload)) {
-		// Claude Sonnet 5 does not support mid-conversation system messages; skip.
-		if (isSonnet5(String(payload.model ?? ""))) return undefined;
-		if (!injectAnthropicTail(arr, content)) return undefined;
-	} else if (!injectTailPrompt(arr, content, role)) return undefined;
-	return payload;
+	if (Array.isArray(messages)) {
+		const arr = messages as Array<Record<string, unknown>>;
+		if (isAnthropicPayload(payload)) {
+			// Claude Sonnet 5 does not support mid-conversation system messages; skip.
+			if (isSonnet5(String(payload.model ?? ""))) return undefined;
+			if (!injectAnthropicTail(arr, content)) return undefined;
+		} else if (!injectTailPrompt(arr, content, role)) return undefined;
+		return payload;
+	}
+	const input = payload.input;
+	if (Array.isArray(input)) {
+		const arr = input as Array<Record<string, unknown>>;
+		if (!injectTailPrompt(arr, content, role)) return undefined;
+		return payload;
+	}
+	return undefined;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -412,15 +509,22 @@ export default function (pi: ExtensionAPI) {
 		if (sessionClass() !== "subagent") return;
 		let systemMd: string;
 		let childRole: string;
+		let childClosing: string;
 		try {
 			systemMd = fs.readFileSync(SYSTEM_PATH, "utf-8");
 			childRole = fs.readFileSync(CHILD_ROLE_PATH, "utf-8");
+			childClosing = fs.readFileSync(CHILD_CLOSING_PATH, "utf-8");
 		} catch (error) {
 			throw new Error(
-				`tail-prompt: child Role splice requires SYSTEM.md and child-role.md: ${error}`,
+				`tail-prompt: child identity splice requires SYSTEM.md, child-role.md, and child-closing.md: ${error}`,
 			);
 		}
-		const next = applyChildSystemPrompt(event.systemPrompt, systemMd, childRole);
+		const next = applyChildSystemPrompt(
+			event.systemPrompt,
+			systemMd,
+			childRole,
+			childClosing,
+		);
 		if (next === event.systemPrompt) return;
 		return { systemPrompt: next };
 	});
