@@ -76,9 +76,7 @@ describe("Identity unit splice", () => {
 	test("replace-mode inserts the entire spliced SYSTEM.md", () => {
 		const agentBody = "You are worker.\n\nDo the task.\n";
 		const out = applyChildSystemPrompt(agentBody, systemMd, childRole);
-		expect(
-			out.startsWith("## Role and Capability") || out.includes("Preamble"),
-		).toBe(true);
+		expect(out.startsWith("Preamble")).toBe(true);
 		expect(out).toContain("Preamble");
 		expect(out).toContain("You are worker.");
 		expectChildIdentity(out);
