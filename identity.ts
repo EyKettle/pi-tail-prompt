@@ -97,7 +97,7 @@ function spliceDiskIdentity(systemMd: string, childRole: string): string {
 	return spliceFoundIdentity(systemMd, childRole);
 }
 
-export function insertAfterChildBoundary(
+function insertAfterChildBoundary(
 	prompt: string,
 	contract: string,
 ): string {
