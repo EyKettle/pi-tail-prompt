@@ -11,7 +11,6 @@ import {
 	parseConfig,
 	applymentForSession,
 	locateRoleChapter,
-	locateClosingIdentity,
 	applyChildSystemPrompt,
 	resolveImportPath,
 	loadPrompts,
@@ -478,24 +477,6 @@ describe("Identity unit splice", () => {
 		"",
 		"---",
 	].join("\n");
-	const parentClosing = [
-		"**This agent is an orchestrator, not an implementer.**",
-		"",
-		"Delegate significant implementation (HB#1).",
-		"",
-		"The full constraint set is in the sections above.",
-		"",
-		"_(End of SOUL)_",
-	].join("\n");
-	const childClosing = [
-		"**This agent is a child subagent.**",
-		"",
-		"Complete the assigned task inside AUTHORIZATION.",
-		"",
-		"The full constraint set is in the sections above.",
-		"",
-		"_(End of SOUL)_",
-	].join("\n");
 	const systemMd = [
 		"Preamble",
 		"",
@@ -507,13 +488,10 @@ describe("Identity unit splice", () => {
 		"",
 		"HB#7",
 		"",
-		parentClosing,
-		"",
 	].join("\n");
 
 	function expectChildIdentity(out: string) {
 		expect(out).toContain("I am a child subagent.");
-		expect(out).toContain("**This agent is a child subagent.**");
 		expect(out).not.toContain("I am an orchestrator, not an implementer.");
 		expect(out).not.toContain(
 			"This agent is an orchestrator, not an implementer.",
@@ -531,67 +509,29 @@ describe("Identity unit splice", () => {
 		expect(locateRoleChapter("no role here\n# Namespace Registry\n")).toBeNull();
 	});
 
-	test("closing locator spans the unique start line through End of SOUL", () => {
-		const span = locateClosingIdentity(systemMd);
-		expect(span).not.toBeNull();
-		const slice = systemMd.slice(span!.start, span!.end).trim();
-		expect(
-			slice.startsWith(
-				"**This agent is an orchestrator, not an implementer.**",
-			),
-		).toBe(true);
-		expect(slice.endsWith("_(End of SOUL)_")).toBe(true);
-		expect(
-			locateClosingIdentity(systemMd.replace("_(End of SOUL)_", "nope")),
-		).toBeNull();
-		expect(
-			locateClosingIdentity(
-				`${systemMd}\n**This agent is an orchestrator, not an implementer.**\n`,
-			),
-		).toBeNull();
-		expect(locateClosingIdentity(`${systemMd}\n_(End of SOUL)_\n`)).toBeNull();
-	});
-
-	test("closing locator is unique on disk SYSTEM.md", () => {
+	test("Role locator holds on disk SYSTEM.md", () => {
 		const disk = fs.readFileSync(
 			path.join(os.homedir(), ".pi", "agent", "SYSTEM.md"),
 			"utf-8",
 		);
 		const lines = disk.split("\n");
-		expect(
-			lines.filter(
-				(l) => l === "**This agent is an orchestrator, not an implementer.**",
-			),
-		).toHaveLength(1);
-		expect(lines.filter((l) => l === "_(End of SOUL)_")).toHaveLength(1);
-		const span = locateClosingIdentity(disk);
+		expect(lines.filter((l) => l === "## Role and Capability")).toHaveLength(1);
+		const span = locateRoleChapter(disk);
 		expect(span).not.toBeNull();
-		const slice = disk.slice(span!.start, span!.end);
-		expect(slice).toContain(
-			"**This agent is an orchestrator, not an implementer.**",
+		expect(disk.slice(span!.start, span!.end)).toContain(
+			"## Role and Capability",
 		);
-		expect(slice.trimEnd().endsWith("_(End of SOUL)_")).toBe(true);
 	});
 
-	test("append-mode replaces Role and closing identity", () => {
-		const out = applyChildSystemPrompt(
-			systemMd,
-			systemMd,
-			childRole,
-			childClosing,
-		);
+	test("append-mode replaces the Role identity unit", () => {
+		const out = applyChildSystemPrompt(systemMd, systemMd, childRole);
 		expectChildIdentity(out);
 		expect(out).toContain("Preamble");
 	});
 
 	test("replace-mode inserts the entire spliced SYSTEM.md", () => {
 		const agentBody = "You are worker.\n\nDo the task.\n";
-		const out = applyChildSystemPrompt(
-			agentBody,
-			systemMd,
-			childRole,
-			childClosing,
-		);
+		const out = applyChildSystemPrompt(agentBody, systemMd, childRole);
 		expect(
 			out.startsWith("## Role and Capability") || out.includes("Preamble"),
 		).toBe(true);
@@ -605,12 +545,7 @@ describe("Identity unit splice", () => {
 	test("replace-mode inserts after child boundary when present", () => {
 		const boundary =
 			"You are a child subagent, not the parent orchestrator.\nStay in role.\n\nYou are worker.\n";
-		const out = applyChildSystemPrompt(
-			boundary,
-			systemMd,
-			childRole,
-			childClosing,
-		);
+		const out = applyChildSystemPrompt(boundary, systemMd, childRole);
 		expect(out.startsWith("You are a child subagent")).toBe(true);
 		const boundaryAt = out.indexOf("You are a child subagent");
 		const contractAt = out.indexOf("Preamble");
@@ -619,87 +554,38 @@ describe("Identity unit splice", () => {
 		expectChildIdentity(out);
 	});
 
-	test("idempotent when both identity units already match child", () => {
-		const already = applyChildSystemPrompt(
-			systemMd,
-			systemMd,
-			childRole,
-			childClosing,
-		);
-		expect(
-			applyChildSystemPrompt(already, systemMd, childRole, childClosing),
-		).toBe(already);
-	});
-
-	test("does not skip closing splice when Role already matches child", () => {
-		const mixed = systemMd.replace(
-			"I am an orchestrator, not an implementer.",
-			"I am a child subagent.",
-		);
-		expect(mixed).toContain("I am a child subagent.");
-		expect(mixed).toContain(
-			"This agent is an orchestrator, not an implementer.",
-		);
-		const out = applyChildSystemPrompt(
-			mixed,
-			systemMd,
-			childRole,
-			childClosing,
-		);
-		expectChildIdentity(out);
+	test("idempotent when the Role unit already matches child", () => {
+		const already = applyChildSystemPrompt(systemMd, systemMd, childRole);
+		expect(applyChildSystemPrompt(already, systemMd, childRole)).toBe(already);
 	});
 
 	test("throws when SYSTEM.md Role locator fails", () => {
 		expect(() =>
-			applyChildSystemPrompt(
-				"agent",
-				"no role chapter\n",
-				childRole,
-				childClosing,
-			),
+			applyChildSystemPrompt("agent", "no role chapter\n", childRole),
 		).toThrow(/Role chapter locator failed/);
-	});
-
-	test("throws when SYSTEM.md closing locator fails", () => {
-		const noClosing = `Preamble\n\n${parentRole}\n\n# Namespace Registry\n\nHB#7\n`;
-		expect(() =>
-			applyChildSystemPrompt("agent", noClosing, childRole, childClosing),
-		).toThrow(/closing identity locator failed/);
 	});
 
 	test("throws when parent identity remains after splice", () => {
 		const leftover = `${systemMd}\nI am an orchestrator, not an implementer.\n`;
-		expect(() =>
-			applyChildSystemPrompt(leftover, leftover, childRole, childClosing),
-		).toThrow(/parent identity/);
+		expect(() => applyChildSystemPrompt(leftover, leftover, childRole)).toThrow(
+			/parent identity/,
+		);
 	});
 
-	test("splices disk SYSTEM.md with published child identity files", () => {
+	test("splices disk SYSTEM.md with the published child role file", () => {
 		const agentHome = path.join(os.homedir(), ".pi", "agent");
 		const disk = fs.readFileSync(path.join(agentHome, "SYSTEM.md"), "utf-8");
 		const publishedRole = fs.readFileSync(
 			path.join(agentHome, "system-prompts", "child-role.md"),
 			"utf-8",
 		);
-		const publishedClosing = fs.readFileSync(
-			path.join(agentHome, "system-prompts", "child-closing.md"),
-			"utf-8",
-		);
-		const out = applyChildSystemPrompt(
-			disk,
-			disk,
-			publishedRole,
-			publishedClosing,
-		);
+		const out = applyChildSystemPrompt(disk, disk, publishedRole);
 		expect(out).toContain("I am a child subagent.");
-		expect(out).toContain("This agent is a child subagent.");
 		expect(out).not.toContain("I am an orchestrator, not an implementer.");
 		expect(out).not.toContain(
 			"This agent is an orchestrator, not an implementer.",
 		);
 		expect(out).toContain("# Namespace Registry");
-		expect(out).toContain("HB#7");
-		expect(out).toContain("## Delegation & Orchestration");
 	});
 });
 
