@@ -11,7 +11,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { materialize } from "./segments.ts";
+import { materialize } from "./source.ts";
 
 function isNotFound(error: unknown): boolean {
 	const code = (error as NodeJS.ErrnoException | undefined)?.code;
@@ -71,7 +71,7 @@ export function resolveImportPath(
 	return resolved;
 }
 
-/** Resolve every name to its canonical path in order, or null on any failure. */
+/** Resolve every name to its canonical path in order; null on an unmapped name or an escape. */
 export function resolvePromptPaths(
 	names: string[],
 	imports: Record<string, string>,

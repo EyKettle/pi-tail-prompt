@@ -1,22 +1,21 @@
 /**
  * Segment registry — the tail block is assembled from ordered segments.
  *
- * A segment is `{ id, position, source }`; `source` is either a `path`
- * (an absolute path re-read on every assembly) or a `text` value. Segments
- * are ordered by `position` descending, then `id` ascending, and their
- * materialized texts are joined by a blank line. A segment whose source cannot
- * be read this time is dropped alone; the rest still deliver.
+ * A segment is `{ id, position, source }`; `source` is either a `path` (an
+ * absolute path re-read on every assembly) or a `text` value. Segments are
+ * ordered by `position` descending, then `id` ascending, and their materialized
+ * texts are joined by a blank line. A segment whose source cannot be read this
+ * time is dropped alone; the rest still deliver.
  *
  * The published contract lives in `docs_zh-CN/api.md`; validation here is its
  * fail-closed implementation.
  */
 
-import * as fs from "node:fs";
 import * as path from "node:path";
+import { materialize, type Source } from "./source.ts";
 
-export type Source =
-	| { kind: "path"; path: string }
-	| { kind: "text"; text: string };
+/** The identifier tail-prompt reserves for its own configured prompts. */
+export const RESERVED_SEGMENT_ID = "tail-prompt";
 
 export type Segment = {
 	id: string;
@@ -32,6 +31,7 @@ export function validateSegment(raw: unknown): Segment | null {
 	if (typeof raw !== "object" || raw === null) return null;
 	const candidate = raw as Record<string, unknown>;
 	if (typeof candidate.id !== "string" || candidate.id.length === 0) return null;
+	if (candidate.id === RESERVED_SEGMENT_ID) return null;
 	if (
 		typeof candidate.position !== "number" ||
 		!Number.isInteger(candidate.position)
@@ -44,23 +44,30 @@ export function validateSegment(raw: unknown): Segment | null {
 	if (kind === "text") {
 		const { text } = source as Record<string, unknown>;
 		if (typeof text !== "string") return null;
-		return { id: candidate.id, position: candidate.position, source: { kind: "text", text } };
+		return {
+			id: candidate.id,
+			position: candidate.position,
+			source: { kind: "text", text },
+		};
 	}
 	if (kind === "path") {
 		const { path: filePath } = source as Record<string, unknown>;
 		if (typeof filePath !== "string" || !path.isAbsolute(filePath)) return null;
-		return { id: candidate.id, position: candidate.position, source: { kind: "path", path: filePath } };
+		return {
+			id: candidate.id,
+			position: candidate.position,
+			source: { kind: "path", path: filePath },
+		};
 	}
 	return null;
 }
 
-/** Materialize a source: read an absolute path, or return the text. Null when unavailable. */
-export function materialize(source: Source): string | null {
-	if (source.kind === "text") return source.text;
+/** A stable identity for a raw registration, so a rejection is reported once. */
+export function fingerprint(raw: unknown): string {
 	try {
-		return fs.readFileSync(source.path, "utf-8").trim();
+		return JSON.stringify(raw);
 	} catch {
-		return null;
+		return String(raw);
 	}
 }
 

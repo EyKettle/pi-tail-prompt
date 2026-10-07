@@ -4,11 +4,9 @@
  * `profiles.subagent.applyment`.
  *
  * Parsing fails closed: an unknown `role` value is rejected rather than
- * silently defaulted to `system`. Session selection (which applyment list
- * applies to which session) lives in session.ts, its own change driver.
+ * silently defaulted to `system`. Reading the file and caching the parse live
+ * in config-file.ts, its own change driver.
  */
-
-import * as fs from "node:fs";
 
 export type ParsedTailYaml = {
 	role: "system" | "user";
@@ -16,6 +14,9 @@ export type ParsedTailYaml = {
 	applyment: string[];
 	subagentApplyment: string[] | undefined;
 };
+
+/** The only profile name the schema recognizes. */
+const SUBAGENT_PROFILE = "subagent";
 
 /** Remove a trailing `#` comment; a `#` at line start or after whitespace starts one. */
 function stripComment(line: string): string {
@@ -25,9 +26,10 @@ function stripComment(line: string): string {
 	return line;
 }
 
-/** The declared `role`, or the default `system`; any other value is rejected. */
+/** The declared `role`, read only at the top level; any other value is rejected. */
 function parseRole(lines: readonly string[]): "system" | "user" {
 	for (const line of lines) {
+		if (!line.startsWith("role:")) continue;
 		const value = line.match(/^role:\s*(\S+)/)?.[1];
 		if (value === undefined) continue;
 		if (value === "user" || value === "system") return value;
@@ -76,7 +78,9 @@ export function parseConfig(raw: string): ParsedTailYaml {
 		if (inProfiles && line !== "applyment:") {
 			const profile = line.match(/^([a-zA-Z0-9_-]+):\s*$/);
 			if (profile) {
-				inSubagent = profile[1] === "subagent";
+				// Only `subagent` is a recognized profile name; any other key line
+				// resets the state so its contents are ignored.
+				inSubagent = profile[1] === SUBAGENT_PROFILE;
 				listTarget = null;
 				continue;
 			}
@@ -103,31 +107,4 @@ export function parseConfig(raw: string): ParsedTailYaml {
 		applyment,
 		subagentApplyment: subagentList ?? undefined,
 	};
-}
-
-let cache: { key: string; parsed: ParsedTailYaml | null } | null = null;
-
-/** Read and parse the config file, re-parsing only when its path, mtime, or size changes. */
-export function readConfig(configPath: string): ParsedTailYaml | null {
-	let mtimeMs = 0;
-	let size = -1;
-	try {
-		const st = fs.statSync(configPath);
-		mtimeMs = st.mtimeMs;
-		size = st.size;
-	} catch {
-		/* no config file yet */
-	}
-	const key = `${configPath}:${mtimeMs}:${size}`;
-	if (cache && cache.key === key) return cache.parsed;
-	let parsed: ParsedTailYaml | null = null;
-	try {
-		if (fs.existsSync(configPath)) {
-			parsed = parseConfig(fs.readFileSync(configPath, "utf-8"));
-		}
-	} catch (error) {
-		console.error(`tail-prompt: config load failed: ${error}`);
-	}
-	cache = { key, parsed };
-	return parsed;
 }

@@ -21,7 +21,9 @@ export function applymentForSession(
 ): string[] | null {
 	if (session === "subagent") {
 		if (parsed.subagentApplyment === undefined) return null;
-		return parsed.subagentApplyment.length > 0 ? parsed.subagentApplyment : null;
+		return parsed.subagentApplyment.length > 0
+			? [...parsed.subagentApplyment]
+			: null;
 	}
-	return parsed.applyment.length > 0 ? parsed.applyment : null;
+	return parsed.applyment.length > 0 ? [...parsed.applyment] : null;
 }
