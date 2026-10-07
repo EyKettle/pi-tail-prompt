@@ -5,7 +5,7 @@
   "private": true,
   "description": "Pi extension: inject configured tail reminders before the latest user message of every provider payload, and splice child-subagent identity",
   "license": "MIT",
-  "packageManager": "pnpm@12.8.1",
+  "packageManager": "pnpm@12.9.1",
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit"
