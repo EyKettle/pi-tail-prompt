@@ -1,0 +1,27 @@
+{
+  "name": "tail-prompt",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "Pi extension: inject configured tail reminders before the latest user message of every provider payload, and splice child-subagent identity",
+  "license": "MIT",
+  "packageManager": "pnpm@12.8.1",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "^1.0.4"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^1.0.4",
+    "@types/node": "^24.0.0",
+    "typescript": "6.0.3",
+    "vitest": "^4.1.11"
+  }
+}

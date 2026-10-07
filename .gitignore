@@ -1,2 +1,5 @@
 node_modules/
+.pi/
 .pi-subagents/
+*.log
+.DS_Store
