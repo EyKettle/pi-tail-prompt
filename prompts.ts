@@ -11,6 +11,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { materialize } from "./segments.ts";
 
 function isNotFound(error: unknown): boolean {
 	const code = (error as NodeJS.ErrnoException | undefined)?.code;
@@ -87,17 +88,13 @@ export function resolvePromptPaths(
 	return paths;
 }
 
-/** Read every already-resolved path in order. Any read failure returns null (fail closed). */
+/** Read every already-resolved path in order, via the shared source materializer. */
 export function loadPrompts(paths: string[]): string[] | null {
 	const prompts: string[] = [];
 	for (const resolved of paths) {
-		let content: string;
-		try {
-			content = fs.readFileSync(resolved, "utf-8");
-		} catch {
-			return null;
-		}
-		prompts.push(content.trim());
+		const text = materialize({ kind: "path", path: resolved });
+		if (text === null) return null;
+		prompts.push(text);
 	}
 	return prompts;
 }

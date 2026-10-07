@@ -1,7 +1,7 @@
 /**
  * Tail Prompt Extension — entry assembly.
  *
- * Delivers the configured tail block on every provider request through exactly
+ * Delivers the assembled tail block on every provider request through exactly
  * one placement, chosen from the model's declared capability:
  *
  *  - The model declares mid-conversation system messages
@@ -10,10 +10,13 @@
  *  - Otherwise: the block is appended as a request-local system message and Pi
  *    folds it into the leading system prompt.
  *
+ * The block is assembled from ordered segments (segments.ts): tail-prompt's own
+ * configured prompts at position 0, plus every segment another extension
+ * registers through the published contract (docs_zh-CN/api.md) on `pi.events`.
  * The block never enters the persisted session history. Configuration lives at
  * `<agent dir>/tail-prompt.yaml`, where the agent directory comes from Pi's own
- * `getAgentDir()`. The assembled block is cached by the config file and every
- * prompt file's mtime and size, so a request re-reads nothing until one changes.
+ * `getAgentDir()`; the assembled block is cached by the config and prompt files'
+ * mtime and size.
  */
 
 import * as fs from "node:fs";
@@ -25,7 +28,13 @@ import {
 import { readConfig } from "./config.ts";
 import { applyTailToPayload } from "./payload.ts";
 import { loadPrompts, resolvePromptPaths } from "./prompts.ts";
+import { SegmentRegistry, validateSegment, type Segment } from "./segments.ts";
 import { applymentForSession, sessionClass } from "./session.ts";
+
+const CONFIG_SEGMENT_ID = "tail-prompt";
+const CONFIG_POSITION = 0;
+const REGISTER_CHANNEL = "tail-prompt:register";
+const READY_CHANNEL = "tail-prompt:ready";
 
 interface TailConfig {
 	role: "system" | "user";
@@ -57,9 +66,36 @@ function fileStamp(filePath: string): string {
 	}
 }
 
+function fingerprint(raw: unknown): string {
+	try {
+		return JSON.stringify(raw);
+	} catch {
+		return String(raw);
+	}
+}
+
 export default function (pi: ExtensionAPI) {
 	const agentDir = getAgentDir();
 	const configPath = path.join(agentDir, "tail-prompt.yaml");
+	const registry = new SegmentRegistry();
+	const rejected = new Set<string>();
+
+	pi.events.on(REGISTER_CHANNEL, (raw) => {
+		const segment = validateSegment(raw);
+		if (segment) {
+			registry.register(segment);
+			return;
+		}
+		const key = fingerprint(raw);
+		if (rejected.has(key)) return;
+		rejected.add(key);
+		throw new Error(`tail-prompt: rejected registration ${key}`);
+	});
+
+	// A contributor that loaded before this extension missed its own emit; the
+	// ready signal asks it to re-send, so either load order takes effect.
+	pi.events.emit(READY_CHANNEL, undefined);
+
 	let cache: { key: string; config: TailConfig | null } | null = null;
 
 	const getConfig = (): TailConfig | null => {
@@ -88,16 +124,29 @@ export default function (pi: ExtensionAPI) {
 		return config;
 	};
 
+	const build = (): { block: string; role: "system" | "user" } | null => {
+		const config = getConfig();
+		if (!config) return null;
+		const configSegment: Segment = {
+			id: CONFIG_SEGMENT_ID,
+			position: CONFIG_POSITION,
+			source: { kind: "text", text: config.block },
+		};
+		const block = registry.assemble([configSegment]);
+		if (block === null) return null;
+		return { block, role: config.role };
+	};
+
 	// Merge branch: the model cannot carry a mid-conversation system message, so
 	// append one to the transcript and let Pi fold it into the leading prompt.
 	pi.on("context_with_system", (event, ctx) => {
 		if (supportsMidConvoSystemMessages(ctx.model)) return;
-		const config = getConfig();
-		if (!config) return;
+		const built = build();
+		if (!built) return;
 		return {
 			messages: [
 				...event.messages,
-				{ role: "system", content: config.block, timestamp: Date.now() },
+				{ role: "system", content: built.block, timestamp: Date.now() },
 			],
 		};
 	});
@@ -106,14 +155,14 @@ export default function (pi: ExtensionAPI) {
 	// the block into the final payload adjacent to the latest user turn.
 	pi.on("before_provider_request", (event, ctx) => {
 		if (!supportsMidConvoSystemMessages(ctx.model)) return;
-		const config = getConfig();
-		if (!config) return;
+		const built = build();
+		if (!built) return;
 		const payload = event.payload as Record<string, unknown> | undefined;
 		if (!payload) return;
 		return applyTailToPayload(
 			payload,
-			config.block,
-			config.role,
+			built.block,
+			built.role,
 			modelApi(ctx.model),
 		);
 	});

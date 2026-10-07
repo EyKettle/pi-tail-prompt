@@ -19,16 +19,51 @@ vi.mock("@earendil-works/pi-coding-agent", async () => {
 import factory from "../index.ts";
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
+type BusHandler = (data: unknown) => void;
+
+function createBus() {
+	const handlers = new Map<string, Set<BusHandler>>();
+	const emitted: Array<{ channel: string; data: unknown }> = [];
+	const errors: Array<{ channel: string; error: unknown }> = [];
+	return {
+		emit(channel: string, data: unknown) {
+			emitted.push({ channel, data });
+			for (const handler of handlers.get(channel) ?? []) {
+				try {
+					handler(data);
+				} catch (error) {
+					errors.push({ channel, error });
+				}
+			}
+		},
+		on(channel: string, handler: BusHandler) {
+			let set = handlers.get(channel);
+			if (!set) {
+				set = new Set();
+				handlers.set(channel, set);
+			}
+			const target = set;
+			target.add(handler);
+			return () => {
+				target.delete(handler);
+			};
+		},
+		emitted,
+		errors,
+	};
+}
 
 function capture() {
 	const handlers: Record<string, Handler[]> = {};
+	const bus = createBus();
 	const pi = {
 		on(event: string, handler: Handler) {
 			(handlers[event] ??= []).push(handler);
 			return () => {};
 		},
+		events: bus,
 	};
-	return { pi, handlers };
+	return { pi, handlers, bus };
 }
 
 const CAPABLE = { model: { compat: { supportsMidConvoSystemMessages: true } } };
@@ -48,10 +83,15 @@ afterEach(() => {
 	else process.env.PI_SUBAGENT_CHILD = previousSubagent;
 });
 
+function scratchDir(prefix: string): string {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+	created.push(dir);
+	return dir;
+}
+
 /** A scratch agent dir holding a config whose block is "BLOCK-A". */
 function scratchAgentDir(): string {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tail-prompt-agent-"));
-	created.push(dir);
+	const dir = scratchDir("tail-prompt-agent-");
 	fs.mkdirSync(path.join(dir, "system-prompts"));
 	fs.writeFileSync(path.join(dir, "system-prompts", "a.txt"), "BLOCK-A\n");
 	fs.writeFileSync(
@@ -71,15 +111,23 @@ function scratchAgentDir(): string {
 }
 
 function load() {
-	const { pi, handlers } = capture();
+	const { pi, handlers, bus } = capture();
 	factory(pi as unknown as ExtensionAPI);
-	return handlers;
+	return { handlers, bus };
+}
+
+function block(handlers: Record<string, Handler[]>): string {
+	const out = handlers.before_provider_request[0](
+		{ payload: { messages: [{ role: "user", content: "u" }] } },
+		CAPABLE,
+	) as { messages: Array<Record<string, unknown>> };
+	return String(out.messages[0].content);
 }
 
 describe("entry assembly", () => {
 	test("reads the configuration from the agent-directory override", () => {
 		scratchAgentDir();
-		const handlers = load();
+		const { handlers } = load();
 		const out = handlers.before_provider_request[0](
 			{ payload: { model: "gpt-5", messages: [{ role: "user", content: "u" }] } },
 			CAPABLE,
@@ -92,23 +140,19 @@ describe("entry assembly", () => {
 
 	test("capable model: the tail branch injects, the merge branch is inert", () => {
 		scratchAgentDir();
-		const handlers = load();
+		const { handlers } = load();
 		expect(
 			handlers.context_with_system[0](
 				{ messages: [{ role: "user", content: "u" }] },
 				CAPABLE,
 			),
 		).toBeUndefined();
-		const out = handlers.before_provider_request[0](
-			{ payload: { messages: [{ role: "user", content: "u" }] } },
-			CAPABLE,
-		) as { messages: Array<Record<string, unknown>> };
-		expect(out.messages[0]).toEqual({ role: "system", content: "BLOCK-A" });
+		expect(block(handlers)).toBe("BLOCK-A");
 	});
 
 	test("incapable model: the merge branch appends the block, the tail branch is inert", () => {
 		scratchAgentDir();
-		const handlers = load();
+		const { handlers } = load();
 		const out = handlers.context_with_system[0](
 			{ messages: [{ role: "user", content: "u" }] },
 			INCAPABLE,
@@ -130,16 +174,14 @@ describe("entry assembly", () => {
 
 	test("no child-identity splice registration remains", () => {
 		scratchAgentDir();
-		const handlers = load();
+		const { handlers } = load();
 		expect(handlers.before_agent_start).toBeUndefined();
 	});
 
 	test("no configuration: nothing is delivered on either branch", () => {
-		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tail-prompt-empty-"));
-		created.push(dir);
-		process.env.PI_CODING_AGENT_DIR = dir;
+		process.env.PI_CODING_AGENT_DIR = scratchDir("tail-prompt-empty-");
 		delete process.env.PI_SUBAGENT_CHILD;
-		const handlers = load();
+		const { handlers } = load();
 		expect(
 			handlers.before_provider_request[0](
 				{ payload: { messages: [{ role: "user", content: "u" }] } },
@@ -152,5 +194,68 @@ describe("entry assembly", () => {
 				INCAPABLE,
 			),
 		).toBeUndefined();
+	});
+});
+
+describe("segment registration", () => {
+	test("emits the ready signal with no payload", () => {
+		scratchAgentDir();
+		const { bus } = load();
+		const ready = bus.emitted.find((e) => e.channel === "tail-prompt:ready");
+		expect(ready).toBeDefined();
+		expect(ready?.data).toBeUndefined();
+	});
+
+	test("a registered text segment is delivered on the next request", () => {
+		scratchAgentDir();
+		const { handlers, bus } = load();
+		bus.emit("tail-prompt:register", {
+			id: "x",
+			position: 1,
+			source: { kind: "text", text: "SEG" },
+		});
+		expect(block(handlers)).toBe("SEG\n\nBLOCK-A");
+	});
+
+	test("re-registering the same identifier replaces it", () => {
+		scratchAgentDir();
+		const { handlers, bus } = load();
+		bus.emit("tail-prompt:register", {
+			id: "x",
+			position: 1,
+			source: { kind: "text", text: "old" },
+		});
+		bus.emit("tail-prompt:register", {
+			id: "x",
+			position: 1,
+			source: { kind: "text", text: "new" },
+		});
+		expect(block(handlers)).toBe("new\n\nBLOCK-A");
+	});
+
+	test("an invalid registration is dropped, reported once, and interrupts nothing", () => {
+		scratchAgentDir();
+		const { handlers, bus } = load();
+		const bad = { id: "", position: 1, source: { kind: "text", text: "bad" } };
+		bus.emit("tail-prompt:register", bad);
+		bus.emit("tail-prompt:register", bad);
+		expect(block(handlers)).toBe("BLOCK-A");
+		expect(bus.errors).toHaveLength(1);
+	});
+
+	test("a path segment tracks its file with no further registration", () => {
+		scratchAgentDir();
+		const { handlers, bus } = load();
+		const dir = scratchDir("tail-prompt-seg-");
+		const file = path.join(dir, "seg.txt");
+		fs.writeFileSync(file, "ONE\n");
+		bus.emit("tail-prompt:register", {
+			id: "p",
+			position: 1,
+			source: { kind: "path", path: file },
+		});
+		expect(block(handlers)).toBe("ONE\n\nBLOCK-A");
+		fs.writeFileSync(file, "TWO\n");
+		expect(block(handlers)).toBe("TWO\n\nBLOCK-A");
 	});
 });
