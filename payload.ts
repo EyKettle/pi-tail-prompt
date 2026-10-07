@@ -10,114 +10,114 @@
  * following tool_calls message"), so the insert point is the latest user message.
  *
  *  - OpenAI-compatible Chat (payload.messages array, no top-level `system`):
- *    inject {role, content} immediately BEFORE the latest user message.
+ *    insert {role, content} immediately BEFORE the latest user message.
  *  - OpenAI Responses (payload.input array when messages is absent): same
- *    latest-user-before-insert rule as Chat.
- *  - Anthropic Messages API (top-level `system` + `max_tokens`): inject a
- *    {role:"system"} mid-conversation message immediately AFTER the latest user
- *    turn (Anthropic requires system to follow a user turn, not lead the
- *    array). Claude Sonnet 5 lacks mid-conversation support, so it is skipped.
- * Other provider shapes are skipped untouched.
+ *    latest-user-before rule as Chat.
+ *  - Anthropic Messages API: insert {role:"system", content} immediately AFTER
+ *    the latest user turn (Anthropic requires a mid-conversation message to
+ *    follow a user turn, not lead the array). This branch exists for a model
+ *    that accepts mid-conversation system messages, so the inserted role is
+ *    fixed to `system`; the configured role applies only to the messages-array
+ *    (Chat/Responses) shape.
+ *
+ * Every adapter constructs and returns new arrays; nothing is mutated in place.
+ * The Anthropic branch is selected when either signal says Anthropic: the
+ * model's declared protocol (`api`), or the payload's top-level `system` field
+ * (which OpenAI Chat and Responses never carry). The payload signal catches a
+ * request routed away from the session model's protocol; the declared protocol
+ * catches an Anthropic request whose leading system text is empty.
  */
 
-/**
- * Index of the latest user-role message, or -1 when none exists. Guarded
- * against null/undefined array elements.
- */
+/** Index of the latest user-role message, or -1 when none exists. Guarded against null elements. */
 function findLatestUserIndex(messages: Array<Record<string, unknown>>): number {
 	return messages.findLastIndex((m) => m?.role === "user");
 }
 
 /**
- * Insert the tail prompt immediately before the latest user message.
- *
- * Mutates the given payload messages array in place (matching the hook's
- * handling). Returns the array, or null when no user message exists — the
- * caller then leaves the payload untouched. No idempotence guard: a leading
- * system message (the standard OpenAI layout) is legitimate and must not be
- * mistaken for an already-injected reminder; the hook runs once per fresh
- * payload, so double-injection cannot self-occur.
+ * Return a new array with the tail prompt inserted immediately before the
+ * latest user message, or null when there is no user message (the caller then
+ * leaves the payload untouched).
  */
 export function injectTailPrompt(
 	messages: Array<Record<string, unknown>>,
 	content: string,
 	role: "system" | "user",
 ): Array<Record<string, unknown>> | null {
-	const lastUserIndex = findLatestUserIndex(messages);
-	if (lastUserIndex === -1) return null;
-	messages.splice(lastUserIndex, 0, { role, content });
-	return messages;
+	const index = findLatestUserIndex(messages);
+	if (index === -1) return null;
+	return [
+		...messages.slice(0, index),
+		{ role, content },
+		...messages.slice(index),
+	];
 }
 
 /**
- * Detect an Anthropic Messages API payload: it carries a top-level `system`
- * field (OpenAI Chat never does) alongside `max_tokens` and a `messages` array.
+ * Whether the request targets the Anthropic Messages API. Either signal is
+ * enough: the declared protocol, or the top-level `system` marker (which OpenAI
+ * Chat and Responses never carry). The payload marker catches a request routed
+ * away from the session model's protocol; the declared protocol catches an
+ * Anthropic request whose leading system text is empty.
  */
-export function isAnthropicPayload(payload: Record<string, unknown>): boolean {
-	return (
-		payload.max_tokens !== undefined &&
-		payload.system !== undefined &&
-		Array.isArray(payload.messages)
-	);
+export function isAnthropicPayload(
+	payload: Record<string, unknown>,
+	api?: string,
+): boolean {
+	if (api === "anthropic-messages") return true;
+	return payload.system !== undefined && Array.isArray(payload.messages);
 }
 
 /**
- * Claude Sonnet 5 does not support mid-conversation system messages; the
- * extension skips injection for it. Matches ids like "claude-sonnet-5" or
- * "claude-sonnet-5-20260101", never "claude-sonnet-4-5".
- */
-export function isSonnet5(model: string): boolean {
-	return /sonnet-?5(?:$|[^0-9])/i.test(model);
-}
-
-/**
- * Insert the tail prompt as a mid-conversation system message immediately
- * AFTER the latest user turn — Anthropic's placement rule requires a system
- * message to follow a user turn (including one carrying tool_result blocks)
- * and precede an assistant turn or end the array. A system message cannot be
- * the first entry in `messages`; inserting after the first user message yields
- * [user, system], which is allowed. Returns the array, or null when no user
- * message exists.
+ * Return a new array with a system message inserted immediately after the latest
+ * user turn, or null when there is no user message. No idempotence guard: the
+ * payload is rebuilt per request and this adapter runs once per fresh payload,
+ * so a guard would only suppress injection when another producer legitimately
+ * placed a message after the latest user turn.
  */
 export function injectAnthropicTail(
 	messages: Array<Record<string, unknown>>,
 	content: string,
 ): Array<Record<string, unknown>> | null {
-	const lastUserIndex = findLatestUserIndex(messages);
-	if (lastUserIndex === -1) return null;
-	if (messages[lastUserIndex + 1]?.role === "system") return null; // idempotence
-	messages.splice(lastUserIndex + 1, 0, { role: "system", content });
-	return messages;
+	const index = findLatestUserIndex(messages);
+	if (index === -1) return null;
+	return [
+		...messages.slice(0, index + 1),
+		{ role: "system", content },
+		...messages.slice(index + 1),
+	];
 }
 
 /**
  * Route a provider payload through the correct tail-injection adapter.
  *
- * Pure and hook-independent so the full routing (Anthropic dispatch, Sonnet 5
- * skip, Chat messages, Responses input) is unit-testable without a live event
- * emitter. Returns the (mutated) payload, or undefined when nothing should be
- * sent back as a replacement (the handler then leaves the payload untouched).
+ * Pure and hook-independent so the full routing is unit-testable without a
+ * live event emitter. Returns a new payload, or undefined when nothing should
+ * be sent back as a replacement (the handler then leaves the payload untouched).
  */
 export function applyTailToPayload(
 	payload: Record<string, unknown>,
 	content: string,
 	role: "system" | "user",
+	api?: string,
 ): Record<string, unknown> | undefined {
 	const messages = payload.messages;
 	if (Array.isArray(messages)) {
 		const arr = messages as Array<Record<string, unknown>>;
-		if (isAnthropicPayload(payload)) {
-			// Claude Sonnet 5 does not support mid-conversation system messages; skip.
-			if (isSonnet5(String(payload.model ?? ""))) return undefined;
-			if (!injectAnthropicTail(arr, content)) return undefined;
-		} else if (!injectTailPrompt(arr, content, role)) return undefined;
-		return payload;
+		const next = isAnthropicPayload(payload, api)
+			? injectAnthropicTail(arr, content)
+			: injectTailPrompt(arr, content, role);
+		if (!next) return undefined;
+		return { ...payload, messages: next };
 	}
 	const input = payload.input;
 	if (Array.isArray(input)) {
-		const arr = input as Array<Record<string, unknown>>;
-		if (!injectTailPrompt(arr, content, role)) return undefined;
-		return payload;
+		const next = injectTailPrompt(
+			input as Array<Record<string, unknown>>,
+			content,
+			role,
+		);
+		if (!next) return undefined;
+		return { ...payload, input: next };
 	}
 	return undefined;
 }

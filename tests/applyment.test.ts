@@ -1,31 +1,18 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { describe, expect, test } from "vitest";
-import { applymentForSession, parseConfig, sessionClass } from "./config.ts";
-import { applyTailToPayload } from "./payload.ts";
-import { loadPrompts } from "./prompts.ts";
+import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import { parseConfig } from "../config.ts";
+import { applyTailToPayload } from "../payload.ts";
+import { loadPrompts, resolvePromptPaths } from "../prompts.ts";
+import { applymentForSession, sessionClass } from "../session.ts";
+import { PROFILE_YAML } from "./fixtures.ts";
 
-describe("child applyment integration", () => {
-	const yaml = [
-		"role: system",
-		"imports:",
-		"  decompose: system-prompts/decompose-thinking.txt",
-		"  contract: system-prompts/working-contract.txt",
-		"  child-contract: system-prompts/child-working-contract.txt",
-		"applyment:",
-		"  - decompose",
-		"  - contract",
-		"profiles:",
-		"  subagent:",
-		"    applyment:",
-		"      - decompose",
-		"      - child-contract",
-		"",
-	].join("\n");
+describe("subagent applyment integration", () => {
+	let root: string;
 
-	test("injects thinking-step and skill-load tags into messages and input", () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "tail-prompt-child-"));
+	beforeAll(() => {
+		root = fs.mkdtempSync(path.join(os.tmpdir(), "tail-prompt-child-"));
 		fs.mkdirSync(path.join(root, "system-prompts"));
 		fs.writeFileSync(
 			path.join(root, "system-prompts", "decompose-thinking.txt"),
@@ -35,15 +22,22 @@ describe("child applyment integration", () => {
 			path.join(root, "system-prompts", "child-working-contract.txt"),
 			'<instruction target="skill-load" kind="any" type="action">load</instruction>\n',
 		);
-		const parsed = parseConfig(yaml);
+	});
+
+	afterAll(() => {
+		fs.rmSync(root, { recursive: true, force: true });
+	});
+
+	test("injects the child applyment block into messages and input", () => {
+		const parsed = parseConfig(PROFILE_YAML);
 		const names = applymentForSession(
 			parsed,
 			sessionClass({ PI_SUBAGENT_CHILD: "1" }),
 		);
 		expect(names).toEqual(["decompose", "child-contract"]);
-		const prompts = loadPrompts(names!, parsed.imports, root);
+		const prompts = loadPrompts(resolvePromptPaths(names!, parsed.imports, root)!);
 		expect(prompts).not.toBeNull();
-		const content = prompts!.join("\n\n");
+		const block = prompts!.join("\n\n");
 
 		const chatPayload = {
 			model: "gpt-5",
@@ -62,23 +56,21 @@ describe("child applyment integration", () => {
 
 		const chatOut = applyTailToPayload(
 			chatPayload as unknown as Record<string, unknown>,
-			content,
+			block,
 			parsed.role,
-		);
+		)!;
 		const inputOut = applyTailToPayload(
 			inputPayload as unknown as Record<string, unknown>,
-			content,
+			block,
 			parsed.role,
-		);
-		expect(chatOut).toBe(chatPayload);
-		expect(inputOut).toBe(inputPayload);
+		)!;
 
-		const chatInjected = chatPayload.messages.find((m) =>
-			String(m.content).includes("<instruction"),
-		);
-		const inputInjected = inputPayload.input.find((m) =>
-			String(m.content).includes("<instruction"),
-		);
+		const chatInjected = (
+			chatOut.messages as Array<Record<string, unknown>>
+		).find((m) => String(m.content).includes("<instruction"));
+		const inputInjected = (
+			inputOut.input as Array<Record<string, unknown>>
+		).find((m) => String(m.content).includes("<instruction"));
 		expect(chatInjected).toBeDefined();
 		expect(inputInjected).toBeDefined();
 		expect(String(chatInjected!.content)).toContain(

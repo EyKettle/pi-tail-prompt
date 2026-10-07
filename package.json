@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "type": "module",
   "private": true,
-  "description": "Pi extension: inject configured tail reminders before the latest user message of every provider payload, and splice child-subagent identity",
+  "description": "Pi extension: deliver a configured tail block on every provider request, adjacent to the latest user turn or folded into the leading system prompt",
   "license": "MIT",
   "packageManager": "pnpm@12.9.1",
   "scripts": {
