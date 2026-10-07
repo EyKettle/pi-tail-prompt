@@ -16,7 +16,11 @@ vi.mock("@earendil-works/pi-coding-agent", async () => {
 	};
 });
 
-import factory from "../index.ts";
+import factory, {
+	blockKey,
+	configSegment,
+	createBlockLoader,
+} from "../index.ts";
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 type BusHandler = (data: unknown) => void;
@@ -172,6 +176,32 @@ describe("entry assembly", () => {
 		).toBeUndefined();
 	});
 
+	test("a subagent session uses the child applyment profile", () => {
+		const dir = scratchDir("tail-prompt-subagent-");
+		fs.mkdirSync(path.join(dir, "system-prompts"));
+		fs.writeFileSync(path.join(dir, "system-prompts", "main.txt"), "MAIN\n");
+		fs.writeFileSync(path.join(dir, "system-prompts", "child.txt"), "CHILD\n");
+		fs.writeFileSync(
+			path.join(dir, "tail-prompt.yaml"),
+			[
+				"role: system",
+				"imports:",
+				"  main: system-prompts/main.txt",
+				"  child: system-prompts/child.txt",
+				"applyment:",
+				"  - main",
+				"profiles:",
+				"  subagent:",
+				"    applyment:",
+				"      - child",
+				"",
+			].join("\n"),
+		);
+		process.env.PI_CODING_AGENT_DIR = dir;
+		process.env.PI_SUBAGENT_CHILD = "1";
+		const { handlers } = load();
+		expect(block(handlers)).toBe("CHILD");
+	});
 	test("no child-identity splice registration remains", () => {
 		scratchAgentDir();
 		const { handlers } = load();
@@ -257,5 +287,72 @@ describe("segment registration", () => {
 		expect(block(handlers)).toBe("ONE\n\nBLOCK-A");
 		fs.writeFileSync(file, "TWO\n");
 		expect(block(handlers)).toBe("TWO\n\nBLOCK-A");
+	});
+});
+
+describe("registration load order", () => {
+	test("a contributor that loaded first registers through the ready signal", () => {
+		scratchAgentDir();
+		const { pi, handlers, bus } = capture();
+		// The contributor loads before this extension: its emit reaches no
+		// subscriber, so it subscribes to ready and re-sends on receipt.
+		const registration = {
+			id: "early",
+			position: 1,
+			source: { kind: "text", text: "EARLY" },
+		};
+		bus.emit("tail-prompt:register", registration);
+		bus.on("tail-prompt:ready", () => {
+			bus.emit("tail-prompt:register", registration);
+		});
+		factory(pi as unknown as ExtensionAPI);
+		expect(block(handlers)).toBe("EARLY\n\nBLOCK-A");
+	});
+});
+
+describe("block loader", () => {
+	test("blockKey joins the config stamp with every prompt stamp", () => {
+		expect(blockKey("cfg", ["a", "b"], (p) => (p === "a" ? "s1" : "s2"))).toBe(
+			"cfg|s1|s2",
+		);
+	});
+
+	test("configSegment is the reserved position-0 text segment", () => {
+		expect(configSegment("BODY")).toEqual({
+			id: "tail-prompt",
+			position: 0,
+			source: { kind: "text", text: "BODY" },
+		});
+	});
+
+	test("createBlockLoader caches by the combined key and reloads when it moves", () => {
+		let promptStamp = "p1";
+		let reads = 0;
+		const parsed = {
+			role: "system" as const,
+			imports: { a: "a.txt" },
+			applyment: ["a"],
+			subagentApplyment: undefined,
+		};
+		const load = createBlockLoader(
+			{
+				readConfig: () => ({ parsed, stamp: "cfg" }),
+				session: () => "main",
+				applyment: (config) => config.applyment,
+				resolvePaths: () => ["/a"],
+				readPrompts: () => {
+					reads += 1;
+					return ["BODY"];
+				},
+				fileStamp: () => promptStamp,
+			},
+			"/agent",
+		);
+		expect(load()).toEqual({ role: "system", block: "BODY" });
+		expect(load()).toEqual({ role: "system", block: "BODY" });
+		expect(reads).toBe(1);
+		promptStamp = "p2";
+		expect(load()).toEqual({ role: "system", block: "BODY" });
+		expect(reads).toBe(2);
 	});
 });

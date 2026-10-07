@@ -86,6 +86,18 @@ describe("injectTailPrompt", () => {
 	test("empty array: returns null", () => {
 		expect(injectTailPrompt([], "REMIND", "system")).toBeNull();
 	});
+
+	test("tolerates null and undefined elements", () => {
+		const messages = [
+			null,
+			{ role: "user", content: "u" },
+			undefined,
+		] as unknown as Array<Record<string, unknown>>;
+		const out = injectTailPrompt(messages, "REMIND", "system")!;
+		expect(out[0]).toBeNull();
+		expect(out[1]).toEqual({ role: "system", content: "REMIND" });
+		expect(out[2]).toEqual({ role: "user", content: "u" });
+	});
 });
 
 describe("injectAnthropicTail", () => {

@@ -4,10 +4,11 @@ import * as path from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
 	SegmentRegistry,
-	materialize,
+	RESERVED_SEGMENT_ID,
 	validateSegment,
 	type Segment,
 } from "../segments.ts";
+import { materialize } from "../source.ts";
 
 describe("validateSegment", () => {
 	const ok = { id: "a", position: 1, source: { kind: "text", text: "x" } };
@@ -20,6 +21,10 @@ describe("validateSegment", () => {
 			source: { kind: "path", path: "/tmp/x" },
 		};
 		expect(validateSegment(pathSeg)).toEqual(pathSeg);
+	});
+
+	test("rejects the reserved identifier", () => {
+		expect(validateSegment({ ...ok, id: RESERVED_SEGMENT_ID })).toBeNull();
 	});
 
 	test("rejects every contract violation", () => {
