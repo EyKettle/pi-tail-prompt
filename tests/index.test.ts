@@ -411,3 +411,140 @@ describe("block loader", () => {
 	});
 });
 
+describe("merge-branch predicate", () => {
+	test("merges only for a system block the model cannot carry mid-conversation", () => {
+		expect(usesMergeBranch(true, "system")).toBe(false);
+		expect(usesMergeBranch(true, "user")).toBe(false);
+		expect(usesMergeBranch(false, "system")).toBe(true);
+		expect(usesMergeBranch(false, "user")).toBe(false);
+	});
+});
+
+describe("role: user on a model without mid-conversation support", () => {
+	function roleUserAgentDir(): string {
+		const dir = scratchDir("tail-prompt-role-user-");
+		fs.mkdirSync(path.join(dir, "system-prompts"));
+		fs.writeFileSync(path.join(dir, "system-prompts", "a.txt"), "BLOCK-A\n");
+		fs.writeFileSync(
+			path.join(dir, "tail-prompt.yaml"),
+			[
+				"role: user",
+				"imports:",
+				"  a: system-prompts/a.txt",
+				"applyment:",
+				"  - a",
+				"",
+			].join("\n"),
+		);
+		process.env.PI_CODING_AGENT_DIR = dir;
+		delete process.env.PI_SUBAGENT_CHILD;
+		return dir;
+	}
+
+	test("non-Anthropic: the block is tail-inserted", () => {
+		roleUserAgentDir();
+		const { handlers } = load();
+		const out = handlers.before_provider_request[0](
+			{ payload: { messages: [{ role: "user", content: "u" }] } },
+			INCAPABLE,
+		) as { messages: Array<Record<string, unknown>> };
+		expect(out.messages).toEqual([
+			{ role: "user", content: "BLOCK-A" },
+			{ role: "user", content: "u" },
+		]);
+	});
+
+	test("Anthropic protocol: the tail branch owns it, before the latest user", () => {
+		roleUserAgentDir();
+		const { handlers } = load();
+		const ctx = {
+			model: {
+				compat: { supportsMidConvoSystemMessages: false },
+				api: "anthropic-messages",
+			},
+			hasUI: false,
+		};
+		// A user block is legal at the tail, so the merge branch stays inert.
+		expect(
+			handlers.context_with_system[0](
+				{ messages: [{ role: "user", content: "u" }] },
+				ctx,
+			),
+		).toBeUndefined();
+		const out = handlers.before_provider_request[0](
+			{ payload: { messages: [{ role: "user", content: "u" }] } },
+			ctx,
+		) as { messages: Array<Record<string, unknown>> };
+		expect(out.messages).toEqual([
+			{ role: "user", content: "BLOCK-A" },
+			{ role: "user", content: "u" },
+		]);
+	});
+});
+
+describe("shape-independent fallback", () => {
+	test("a payload with neither messages nor input still receives the block", () => {
+		scratchAgentDir();
+		const { handlers } = load();
+		const out = handlers.before_provider_request[0](
+			{ payload: { model: "x", system: "LEAD" } },
+			CAPABLE,
+		) as { system: string };
+		expect(out.system).toBe("LEAD\n\nBLOCK-A");
+	});
+
+	test("no leading system content: the request is reported instead", () => {
+		scratchAgentDir();
+		const { handlers } = load();
+		const notices: string[] = [];
+		handlers.before_provider_request[0](
+			{ payload: { model: "x" } },
+			{
+				...CAPABLE,
+				hasUI: true,
+				ui: { notify: (message: string) => notices.push(message) },
+			},
+		);
+		expect(notices).toHaveLength(1);
+		expect(notices[0]).toContain("no leading system");
+	});
+});
+
+describe("one placement per request", () => {
+	test("merge configuration: the block appears exactly once after folding", () => {
+		scratchAgentDir();
+		const { handlers } = load();
+		const transcript = [
+			{ role: "system", content: "S" },
+			{ role: "user", content: "u" },
+		];
+		// 1) The transcript path appends the block for a model without
+		// mid-conversation system support.
+		const appended = handlers.context_with_system[0](
+			{ messages: transcript },
+			INCAPABLE,
+		) as { messages: Array<Record<string, unknown>> };
+		expect(appended).toBeDefined();
+		// 2) Pi collapses such a transcript: the leading system message becomes
+		// the replayed concatenation of every system message, in order.
+		const systems = appended.messages.filter((m) => m.role === "system");
+		const others = appended.messages.filter((m) => m.role !== "system");
+		const payload = {
+			model: "gpt-5",
+			messages: [
+				{
+					role: "system",
+					content: systems.map((m) => String(m.content)).join("\n\n"),
+				},
+				...others,
+			],
+		};
+		// 3) The payload hook must leave this payload untouched.
+		expect(
+			handlers.before_provider_request[0]({ payload }, INCAPABLE),
+		).toBeUndefined();
+		// 4) The block appears exactly once in the folded leading prompt.
+		const leading = String(payload.messages[0].content);
+		expect(leading.split("BLOCK-A").length - 1).toBe(1);
+	});
+});
