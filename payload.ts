@@ -64,7 +64,7 @@ export function isAnthropicPayload(
 	api?: string,
 ): boolean {
 	if (api === "anthropic-messages") return true;
-	return payload.system !== undefined && Array.isArray(payload.messages);
+	return payload.system !== undefined;
 }
 
 /**
