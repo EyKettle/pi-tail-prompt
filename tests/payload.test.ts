@@ -107,7 +107,7 @@ describe("injectAnthropicTail", () => {
 			{ role: "assistant", content: [{ type: "text", text: "a" }] },
 			{ role: "user", content: "u2" },
 		];
-		const out = injectAnthropicTail(messages, "REMIND");
+		const out = injectAnthropicTail(messages, "REMIND", "system");
 		expect(out).not.toBe(messages);
 		expect(out!.map((m) => m.role)).toEqual([
 			"user",
@@ -131,7 +131,7 @@ describe("injectAnthropicTail", () => {
 				content: [{ type: "tool_result", tool_use_id: "t1", content: "r" }],
 			},
 		];
-		const out = injectAnthropicTail(messages, "REMIND")!;
+		const out = injectAnthropicTail(messages, "REMIND", "system")!;
 		expect(out.map((m) => m.role)).toEqual([
 			"user",
 			"assistant",
@@ -141,16 +141,31 @@ describe("injectAnthropicTail", () => {
 	});
 
 	test("single user message: appends after it (not as first entry, so legal)", () => {
-		const out = injectAnthropicTail([{ role: "user", content: "u1" }], "REMIND")!;
+		const out = injectAnthropicTail([{ role: "user", content: "u1" }], "REMIND", "system")!;
 		expect(out.map((m) => m.role)).toEqual(["user", "system"]);
 	});
 
+	test("user role: leads the latest user message instead of following it", () => {
+		const messages = [
+			{ role: "user", content: "u1" },
+			{ role: "assistant", content: [{ type: "text", text: "a" }] },
+			{ role: "user", content: "u2" },
+		];
+		const out = injectAnthropicTail(messages, "REMIND", "user")!;
+		expect(out.map((m) => m.role)).toEqual([
+			"user",
+			"assistant",
+			"user",
+			"user",
+		]);
+		expect(out[2]).toEqual({ role: "user", content: "REMIND" });
+	});
 	test("no idempotence guard: injects even when a system message already follows", () => {
 		const messages = [
 			{ role: "user", content: "u1" },
 			{ role: "system", content: "existing" },
 		];
-		const out = injectAnthropicTail(messages, "REMIND")!;
+		const out = injectAnthropicTail(messages, "REMIND", "system")!;
 		expect(out.map((m) => m.role)).toEqual(["user", "system", "system"]);
 		expect(out[1]).toEqual({ role: "system", content: "REMIND" });
 		expect(out[2]).toEqual({ role: "system", content: "existing" });
@@ -163,7 +178,7 @@ describe("injectAnthropicTail", () => {
 				content: [{ type: "tool_use", id: "t1", name: "read", input: {} }],
 			},
 		];
-		expect(injectAnthropicTail(messages, "REMIND")).toBeNull();
+		expect(injectAnthropicTail(messages, "REMIND", "system")).toBeNull();
 	});
 });
 
@@ -247,6 +262,22 @@ describe("applyTailToPayload (hook routing)", () => {
 		]);
 	});
 
+	test("Anthropic payload with a user role: leads the latest user message", () => {
+		const payload = anthropicPayload();
+		const out = applyTailToPayload(
+			payload as unknown as Record<string, unknown>,
+			"REMIND",
+			"user",
+		)!;
+		const messages = out.messages as Array<Record<string, unknown>>;
+		expect(messages.map((m) => m.role)).toEqual([
+			"user",
+			"assistant",
+			"user",
+			"user",
+		]);
+		expect(messages[2]).toEqual({ role: "user", content: "REMIND" });
+	});
 	test("Anthropic by declared protocol even without a top-level system field", () => {
 		const payload = {
 			model: "claude-sonnet-5",

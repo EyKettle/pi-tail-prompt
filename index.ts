@@ -169,19 +169,15 @@ export function buildBlock(
 
 /**
  * Merge only when tail insertion would be illegal: the model lacks
- * mid-conversation system support, and the payload cannot carry the configured
- * role — either because the role is `system`, or because the Anthropic branch
- * fixes the inserted role to `system`.
+ * mid-conversation system support and the configured role is `system`. The
+ * model's protocol takes no part in this decision; it only distinguishes the
+ * payload shapes once the tail branch owns the request (payload.ts).
  */
 export function usesMergeBranch(
 	supportsMidConvoSystemMessages: boolean,
 	role: "system" | "user",
-	api: string | undefined,
 ): boolean {
-	return (
-		!supportsMidConvoSystemMessages &&
-		(role === "system" || api === "anthropic-messages")
-	);
+	return !supportsMidConvoSystemMessages && role === "system";
 }
 
 function supportsMidConvoSystemMessages(model: ModelView | undefined): boolean {
@@ -279,7 +275,6 @@ export default function (pi: ExtensionAPI) {
 			!usesMergeBranch(
 				supportsMidConvoSystemMessages(ctx.model),
 				built.role,
-				modelApi(ctx.model),
 			)
 		) {
 			return;
@@ -297,11 +292,9 @@ export default function (pi: ExtensionAPI) {
 	pi.on("before_provider_request", (event, ctx) => {
 		const built = buildBlock(deliver(ctx), registry);
 		if (!built) return;
-		const api = modelApi(ctx.model);
 		const merge = usesMergeBranch(
 			supportsMidConvoSystemMessages(ctx.model),
 			built.role,
-			api,
 		);
 		const payload = event.payload as Record<string, unknown> | undefined;
 		// The merge configuration delivered the block through the transcript;
@@ -311,7 +304,7 @@ export default function (pi: ExtensionAPI) {
 			payload,
 			built.block,
 			built.role,
-			api,
+			modelApi(ctx.model),
 		);
 		if (placed) return placed;
 		const merged = mergeBlockIntoLeadingSystem(payload, built.block);

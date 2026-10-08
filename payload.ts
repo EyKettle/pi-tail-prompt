@@ -13,12 +13,11 @@
  *    insert {role, content} immediately BEFORE the latest user message.
  *  - OpenAI Responses (payload.input array when messages is absent): same
  *    latest-user-before rule as Chat.
- *  - Anthropic Messages API: insert {role:"system", content} immediately AFTER
- *    the latest user turn (Anthropic requires a mid-conversation message to
- *    follow a user turn, not lead the array). This branch exists for a model
- *    that accepts mid-conversation system messages, so the inserted role is
- *    fixed to `system`; the configured role applies only to the messages-array
- *    (Chat/Responses) shape.
+ *  - Anthropic Messages API: the anchor follows the configured role — a
+ *    `system` block lands immediately AFTER the latest user turn (Anthropic
+ *    requires a mid-conversation system message to follow a user turn, not lead
+ *    the array); a `user` block lands before the latest user message like every
+ *    other shape. The inserted role is always the configured role.
  *
  * Every adapter constructs and returns new arrays; nothing is mutated in place.
  * The Anthropic branch is selected when either signal says Anthropic: the
@@ -68,22 +67,25 @@ export function isAnthropicPayload(
 }
 
 /**
- * Return a new array with a system message inserted immediately after the latest
- * user turn, or null when there is no user message. No idempotence guard: the
- * payload is rebuilt per request and this adapter runs once per fresh payload,
- * so a guard would only suppress injection when another producer legitimately
- * placed a message after the latest user turn.
+ * Return a new array with the block inserted at the Anthropic Messages anchor,
+ * or null when there is no user message. The anchor follows the configured
+ * role: a `system` block follows the latest user turn, a `user` block leads the
+ * latest user message. No idempotence guard: the payload is rebuilt per request
+ * and this adapter runs once per fresh payload, so a guard would only suppress
+ * injection when another producer legitimately placed a message at that anchor.
  */
 export function injectAnthropicTail(
 	messages: Array<Record<string, unknown>>,
 	content: string,
+	role: "system" | "user",
 ): Array<Record<string, unknown>> | null {
 	const index = findLatestUserIndex(messages);
 	if (index === -1) return null;
+	const anchor = role === "system" ? index + 1 : index;
 	return [
-		...messages.slice(0, index + 1),
-		{ role: "system", content },
-		...messages.slice(index + 1),
+		...messages.slice(0, anchor),
+		{ role, content },
+		...messages.slice(anchor),
 	];
 }
 
@@ -93,6 +95,12 @@ export function injectAnthropicTail(
  * Pure and hook-independent so the full routing is unit-testable without a
  * live event emitter. Returns a new payload, or undefined when nothing should
  * be sent back as a replacement (the handler then leaves the payload untouched).
+ *
+ * The configured role decides the inserted message's role; the payload shape
+ * decides the anchor (the tail placement table in docs_zh-CN/architecture.md):
+ * `messages` and `input` lead the latest user message, and the Anthropic
+ * Messages shape leads it for `user` and follows the latest user turn for
+ * `system`.
  */
 export function applyTailToPayload(
 	payload: Record<string, unknown>,
@@ -104,7 +112,7 @@ export function applyTailToPayload(
 	if (Array.isArray(messages)) {
 		const arr = messages as Array<Record<string, unknown>>;
 		const next = isAnthropicPayload(payload, api)
-			? injectAnthropicTail(arr, content)
+			? injectAnthropicTail(arr, content, role)
 			: injectTailPrompt(arr, content, role);
 		if (!next) return undefined;
 		return { ...payload, messages: next };
