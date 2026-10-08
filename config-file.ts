@@ -20,6 +20,8 @@ export function fileStamp(filePath: string): string {
 export type ConfigRead = {
 	parsed: ParsedTailYaml | null;
 	stamp: string;
+	/** The parse error when the file exists but cannot be parsed. */
+	error: string | null;
 };
 
 /** A reader that parses the config file only when its stamp changes. */
@@ -29,14 +31,16 @@ export function createConfigReader(configPath: string): () => ConfigRead {
 		const stamp = fileStamp(configPath);
 		if (cache && cache.stamp === stamp) return cache;
 		let parsed: ParsedTailYaml | null = null;
-		try {
-			if (stamp !== "missing") {
+		let error: string | null = null;
+		if (stamp !== "missing") {
+			try {
 				parsed = parseConfig(fs.readFileSync(configPath, "utf-8"));
+			} catch (cause) {
+				error = cause instanceof Error ? cause.message : String(cause);
+				console.error(`tail-prompt: config load failed: ${error}`);
 			}
-		} catch (error) {
-			console.error(`tail-prompt: config load failed: ${error}`);
 		}
-		cache = { parsed, stamp };
+		cache = { parsed, stamp, error };
 		return cache;
 	};
 }

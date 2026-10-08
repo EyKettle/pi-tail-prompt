@@ -121,3 +121,65 @@ export function applyTailToPayload(
 	}
 	return undefined;
 }
+
+/**
+ * A system field's content after appending: a string, an array of content
+ * blocks, or an object carrying a `parts` array.
+ */
+type SystemText =
+	| string
+	| Array<Record<string, unknown>>
+	| Record<string, unknown>;
+
+/**
+ * Append text to whatever shape a system field uses: a plain string, an array
+ * of content blocks, or an object with a `parts` array. Undefined when the
+ * shape is not one of those.
+ */
+function appendSystemText(
+	value: unknown,
+	content: string,
+): SystemText | undefined {
+	if (typeof value === "string") return `${value}\n\n${content}`;
+	if (Array.isArray(value)) {
+		const blocks = value as Array<Record<string, unknown>>;
+		return [...blocks, { type: "text", text: content }];
+	}
+	if (typeof value === "object" && value !== null) {
+		const record = value as Record<string, unknown>;
+		if (Array.isArray(record.parts)) {
+			return { ...record, parts: [...record.parts, { text: content }] };
+		}
+	}
+	return undefined;
+}
+
+/**
+ * Shape-independent fallback: merge the block into the payload's leading
+ * system content, whatever field carries it. Probes `system`,
+ * `systemInstruction`, `messages[0]`, then `input[0]`. Returns a new payload,
+ * or undefined when no leading system field can be found.
+ */
+export function mergeBlockIntoLeadingSystem(
+	payload: Record<string, unknown>,
+	content: string,
+): Record<string, unknown> | undefined {
+	for (const field of ["system", "systemInstruction"] as const) {
+		if (payload[field] === undefined) continue;
+		const next = appendSystemText(payload[field], content);
+		if (next !== undefined) return { ...payload, [field]: next };
+	}
+	for (const field of ["messages", "input"] as const) {
+		const array = payload[field];
+		if (!Array.isArray(array) || array.length === 0) continue;
+		const head = array[0] as Record<string, unknown> | undefined;
+		if (!head || typeof head !== "object") continue;
+		if (head.role !== "system" && head.role !== "developer") continue;
+		const next = appendSystemText(head.content, content);
+		if (next === undefined) continue;
+		const copy = [...array];
+		copy[0] = { ...head, content: next };
+		return { ...payload, [field]: copy };
+	}
+	return undefined;
+}

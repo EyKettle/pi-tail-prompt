@@ -19,57 +19,52 @@ describe("prompt loading", () => {
 		fs.rmSync(root, { recursive: true, force: true });
 	});
 
-	test("resolveImportPath keeps paths under the config dir", () => {
+	test("resolveImportPath resolves a relative path under the config dir", () => {
 		expect(resolveImportPath("system-prompts/a.txt", root)).toBe(
-			path.join(fs.realpathSync(root), "system-prompts", "a.txt"),
+			path.join(root, "system-prompts", "a.txt"),
 		);
 	});
 
-	test("resolveImportPath rejects lexical escapes", () => {
-		expect(resolveImportPath("/etc/passwd", root)).toBeNull();
-		expect(resolveImportPath("../secret", root)).toBeNull();
-		expect(resolveImportPath("foo/../../outside", root)).toBeNull();
+	test("resolveImportPath takes an absolute path as it is", () => {
+		expect(resolveImportPath("/etc/prompts/a.txt", root)).toBe(
+			"/etc/prompts/a.txt",
+		);
 	});
 
-	test("resolveImportPath rejects a symlink pointing outside the config dir", () => {
-		const outside = fs.mkdtempSync(path.join(os.tmpdir(), "tail-prompt-out-"));
-		try {
-			const target = path.join(outside, "secret.txt");
-			fs.writeFileSync(target, "secret\n");
-			fs.symlinkSync(target, path.join(root, "link.txt"));
-			expect(resolveImportPath("link.txt", root)).toBeNull();
-		} finally {
-			fs.rmSync(outside, { recursive: true, force: true });
-		}
+	test("resolveImportPath leaves escapes to the filesystem", () => {
+		expect(resolveImportPath("../secret", root)).toBe(
+			path.join(root, "..", "secret"),
+		);
 	});
 
-	test("resolvePromptPaths fails closed on an unmapped name", () => {
+	test("resolvePromptPaths reports an unmapped name", () => {
+		const outcome = resolvePromptPaths(
+			["a", "z"],
+			{ a: "prompts/a.txt" },
+			root,
+		);
+		expect(outcome.failure).toEqual({ kind: "unmapped-import", name: "z" });
+	});
+
+	test("loadPrompts reads resolved paths in order", () => {
 		fs.mkdirSync(path.join(root, "prompts"), { recursive: true });
 		fs.writeFileSync(path.join(root, "prompts", "a.txt"), "A\n");
-		const imports = {
-			a: "prompts/a.txt",
-			b: "prompts/missing.txt",
-		};
-		expect(resolvePromptPaths(["a", "z"], imports, root)).toBeNull();
-		expect(resolvePromptPaths(["a", "b"], imports, root)).not.toBeNull();
+		const resolved = resolvePromptPaths(["a"], { a: "prompts/a.txt" }, root);
+		expect(loadPrompts(resolved.value!)).toEqual({ value: ["A"] });
 	});
 
-	test("loadPrompts fails closed on a missing path and reads the rest", () => {
-		const imports = {
-			a: "prompts/a.txt",
-			b: "prompts/missing.txt",
-		};
-		expect(
-			loadPrompts(resolvePromptPaths(["a", "b"], imports, root)!),
-		).toBeNull();
-		expect(loadPrompts(resolvePromptPaths(["a"], imports, root)!)).toEqual([
-			"A",
-		]);
+	test("loadPrompts reports the first unreadable path", () => {
+		const missing = path.join(root, "prompts", "missing.txt");
+		expect(loadPrompts([missing])).toEqual({
+			failure: { kind: "unreadable-prompt", path: missing },
+		});
 	});
 
-	test("loadPrompts fails closed when a resolved path is unreadable", () => {
+	test("loadPrompts reports a path that is a directory", () => {
 		fs.mkdirSync(path.join(root, "adir"), { recursive: true });
-		const resolved = resolveImportPath("adir", root)!;
-		expect(loadPrompts([resolved])).toBeNull();
+		const resolved = resolveImportPath("adir", root);
+		expect(loadPrompts([resolved])).toEqual({
+			failure: { kind: "unreadable-prompt", path: resolved },
+		});
 	});
 });

@@ -2,13 +2,10 @@
  * Tail Prompt Extension — entry assembly.
  *
  * Delivers the assembled tail block on every provider request through exactly
- * one placement, chosen from the model's declared capability:
- *
- *  - The model declares mid-conversation system messages
- *    (`compat.supportsMidConvoSystemMessages`): the block is inserted into the
- *    final payload adjacent to the latest user turn.
- *  - Otherwise: the block is appended as a request-local system message and Pi
- *    folds it into the leading system prompt.
+ * one placement: the payload tail when insertion is legal, the leading prompt
+ * otherwise (see usesMergeBranch). A configuration that exists but yields no
+ * block is reported once through Pi's UI, and a rejected registration is
+ * reported the same way.
  *
  * The block is assembled from ordered segments (segments.ts): tail-prompt's own
  * configured prompts at position 0, plus every segment another extension
@@ -23,6 +20,7 @@ import * as path from "node:path";
 import {
 	getAgentDir,
 	type ExtensionAPI,
+	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import type { ParsedTailYaml } from "./config.ts";
 import {
@@ -30,8 +28,16 @@ import {
 	fileStamp,
 	type ConfigRead,
 } from "./config-file.ts";
-import { applyTailToPayload } from "./payload.ts";
-import { loadPrompts, resolvePromptPaths } from "./prompts.ts";
+import { failureKey, failureMessage, type BlockFailure } from "./failure.ts";
+import {
+	applyTailToPayload,
+	mergeBlockIntoLeadingSystem,
+} from "./payload.ts";
+import {
+	loadPrompts,
+	resolvePromptPaths,
+	type PromptOutcome,
+} from "./prompts.ts";
 import {
 	RESERVED_SEGMENT_ID,
 	SegmentRegistry,
@@ -48,13 +54,19 @@ import {
 const CONFIG_POSITION = 0;
 const REGISTER_CHANNEL = "tail-prompt:register";
 const READY_CHANNEL = "tail-prompt:ready";
-/** How many distinct rejected registrations the report-once rule remembers. */
-const REJECTED_LIMIT = 64;
+/** How many distinct reports the report-once rule remembers. */
+const REPORTED_LIMIT = 64;
 
 export interface TailConfig {
 	role: "system" | "user";
 	block: string;
 }
+
+export type LoadResult = {
+	config: TailConfig | null;
+	/** The cause when a present config yields no block; null when there is nothing to inject. */
+	failure: BlockFailure | null;
+};
 
 interface ModelView {
 	compat?: unknown;
@@ -70,8 +82,8 @@ export interface BlockLoaderDeps {
 		names: string[],
 		imports: Record<string, string>,
 		configDir: string,
-	) => string[] | null;
-	readPrompts: (paths: string[]) => string[] | null;
+	) => PromptOutcome;
+	readPrompts: (paths: string[]) => PromptOutcome;
 	fileStamp: (filePath: string) => string;
 }
 
@@ -95,45 +107,81 @@ export function configSegment(block: string): Segment {
 
 /**
  * A loader for the configured block, cached by the config and prompt files'
- * stamps. Returns null whenever any input is missing (fail closed).
+ * stamps. A missing config file is not a failure; a config that exists and
+ * yields no block carries its cause.
  */
 export function createBlockLoader(
 	deps: BlockLoaderDeps,
 	agentDir: string,
-): () => TailConfig | null {
-	let cache: { key: string; config: TailConfig | null } | null = null;
-	const miss = (): null => {
-		cache = null;
-		return null;
-	};
+): () => LoadResult {
+	let cache: { key: string; result: LoadResult } | null = null;
 	return () => {
-		const { parsed, stamp } = deps.readConfig();
-		if (!parsed) return miss();
+		const { parsed, stamp, error } = deps.readConfig();
+		const configKey = `cfg:${stamp}`;
+		const remember = (key: string, failure: BlockFailure | null): LoadResult => {
+			const result: LoadResult = { config: null, failure };
+			cache = { key, result };
+			return result;
+		};
+		// Only a config-file-level failure short-circuits: a prompt-level one
+		// must re-evaluate when the prompt file changes.
+		if (cache && cache.key === configKey) return cache.result;
+		if (!parsed) {
+			return remember(
+				configKey,
+				error === null ? null : { kind: "parse", detail: error },
+			);
+		}
 		const names = deps.applyment(parsed, deps.session());
-		if (!names) return miss();
-		const paths = deps.resolvePaths(names, parsed.imports, agentDir);
-		if (!paths) return miss();
+		if (!names) return remember(configKey, { kind: "empty-applyment" });
+		const resolved = deps.resolvePaths(names, parsed.imports, agentDir);
+		if (resolved.failure) {
+			return remember(
+				`${configKey}:${JSON.stringify(resolved.failure)}`,
+				resolved.failure,
+			);
+		}
+		const paths = resolved.value;
 		const key = blockKey(stamp, paths, deps.fileStamp);
-		if (cache && cache.key === key) return cache.config;
-		const prompts = deps.readPrompts(paths);
-		const config = prompts
-			? { role: parsed.role, block: prompts.join("\n\n") }
-			: null;
-		cache = { key, config };
-		return config;
+		if (cache && cache.key === key) return cache.result;
+		const read = deps.readPrompts(paths);
+		const result: LoadResult = read.failure
+			? { config: null, failure: read.failure }
+			: {
+					config: { role: parsed.role, block: read.value.join("\n\n") },
+					failure: null,
+				};
+		cache = { key, result };
+		return result;
 	};
 }
 
 /** The delivered block and its role, or null when nothing contributes. */
 export function buildBlock(
-	load: () => TailConfig | null,
+	result: LoadResult,
 	registry: SegmentRegistry,
 ): { block: string; role: "system" | "user" } | null {
-	const config = load();
-	if (!config) return null;
-	const block = registry.assemble([configSegment(config.block)]);
+	if (!result.config) return null;
+	const block = registry.assemble([configSegment(result.config.block)]);
 	if (block === null) return null;
-	return { block, role: config.role };
+	return { block, role: result.config.role };
+}
+
+/**
+ * Merge only when tail insertion would be illegal: the model lacks
+ * mid-conversation system support, and the payload cannot carry the configured
+ * role — either because the role is `system`, or because the Anthropic branch
+ * fixes the inserted role to `system`.
+ */
+export function usesMergeBranch(
+	supportsMidConvoSystemMessages: boolean,
+	role: "system" | "user",
+	api: string | undefined,
+): boolean {
+	return (
+		!supportsMidConvoSystemMessages &&
+		(role === "system" || api === "anthropic-messages")
+	);
 }
 
 function supportsMidConvoSystemMessages(model: ModelView | undefined): boolean {
@@ -147,10 +195,34 @@ function modelApi(model: ModelView | undefined): string | undefined {
 	return model?.api === undefined ? undefined : String(model.api);
 }
 
+/** Bound a diagnostic so a hostile payload cannot flood the notice. */
+function truncate(text: string, limit = 120): string {
+	return text.length <= limit ? text : `${text.slice(0, limit - 1)}…`;
+}
+
 export default function (pi: ExtensionAPI) {
 	const agentDir = getAgentDir();
 	const registry = new SegmentRegistry();
-	const rejected = new Set<string>();
+	const reported = new Set<string>();
+	const pending = new Map<string, string>();
+
+	/** Remember a report once, and keep it until a hook can surface it. */
+	const note = (key: string, message: string): void => {
+		if (reported.has(key)) return;
+		reported.add(key);
+		if (reported.size > REPORTED_LIMIT) {
+			const oldest = reported.values().next().value;
+			if (oldest !== undefined) reported.delete(oldest);
+		}
+		pending.set(key, message);
+	};
+
+	/** Surface whatever has accumulated, once, through Pi's UI. */
+	const flush = (ctx: ExtensionContext): void => {
+		if (!ctx.hasUI || pending.size === 0) return;
+		for (const message of pending.values()) ctx.ui.notify(message, "warning");
+		pending.clear();
+	};
 
 	const load = createBlockLoader(
 		{
@@ -171,25 +243,47 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		const key = fingerprint(raw);
-		if (rejected.has(key)) return;
-		rejected.add(key);
-		if (rejected.size > REJECTED_LIMIT) {
-			const oldest = rejected.values().next().value;
-			if (oldest !== undefined) rejected.delete(oldest);
-		}
-		throw new Error(`tail-prompt: rejected registration ${key}`);
+		note(
+			`registration:${key}`,
+			"tail-prompt: rejected a registration — it needs a non-empty id " +
+				"other than 'tail-prompt', an integer position, and a source " +
+				`of kind 'path' (absolute) or 'text'; got ${truncate(key)}`,
+		);
 	});
 
 	// A contributor that loaded before this extension missed its own emit; the
 	// ready signal asks it to re-send, so either load order takes effect.
 	pi.events.emit(READY_CHANNEL, undefined);
 
-	// Merge branch: the model cannot carry a mid-conversation system message, so
-	// append one to the transcript and let Pi fold it into the leading prompt.
+	/** Load, surface any failure, and hand the result to the caller. */
+	const deliver = (ctx: ExtensionContext): LoadResult => {
+		const result = load();
+		if (result.failure) {
+			note(failureKey(result.failure), failureMessage(result.failure));
+		}
+		flush(ctx);
+		return result;
+	};
+
+	// A broken configuration is worth surfacing before the first request.
+	pi.on("session_start", (_event, ctx) => {
+		deliver(ctx);
+	});
+
+	// Merge branch: tail insertion is illegal, so append a request-local system
+	// message and let Pi fold it into the leading prompt.
 	pi.on("context_with_system", (event, ctx) => {
-		if (supportsMidConvoSystemMessages(ctx.model)) return;
-		const built = buildBlock(load, registry);
+		const built = buildBlock(deliver(ctx), registry);
 		if (!built) return;
+		if (
+			!usesMergeBranch(
+				supportsMidConvoSystemMessages(ctx.model),
+				built.role,
+				modelApi(ctx.model),
+			)
+		) {
+			return;
+		}
 		return {
 			messages: [
 				...event.messages,
@@ -198,19 +292,35 @@ export default function (pi: ExtensionAPI) {
 		};
 	});
 
-	// Tail branch: the model carries mid-conversation system messages, so insert
-	// the block into the final payload adjacent to the latest user turn.
+	// Tail branch: tail insertion is legal, so insert the block into the final
+	// payload adjacent to the latest user turn.
 	pi.on("before_provider_request", (event, ctx) => {
-		if (!supportsMidConvoSystemMessages(ctx.model)) return;
-		const built = buildBlock(load, registry);
+		const built = buildBlock(deliver(ctx), registry);
 		if (!built) return;
+		const api = modelApi(ctx.model);
+		const merge = usesMergeBranch(
+			supportsMidConvoSystemMessages(ctx.model),
+			built.role,
+			api,
+		);
 		const payload = event.payload as Record<string, unknown> | undefined;
-		if (!payload) return;
-		return applyTailToPayload(
+		// The merge configuration delivered the block through the transcript;
+		// this hook must leave the payload untouched then.
+		if (!payload || merge) return;
+		const placed = applyTailToPayload(
 			payload,
 			built.block,
 			built.role,
-			modelApi(ctx.model),
+			api,
 		);
+		if (placed) return placed;
+		const merged = mergeBlockIntoLeadingSystem(payload, built.block);
+		if (merged) return merged;
+		note(
+			"placement:no-leading-system",
+			"tail-prompt: this request has no leading system content to " +
+				"carry the block",
+		);
+		flush(ctx);
 	});
 }

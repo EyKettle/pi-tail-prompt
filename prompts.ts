@@ -1,100 +1,53 @@
 /**
- * Prompt loading — resolves applyment names to files under the agent config
- * directory and reads them.
+ * Prompt loading — resolves applyment names to files and reads them.
  *
- * Containment is decided on canonical paths: both the root and the target (or
- * its nearest existing ancestor) are `realpath`ed, so a symlink inside the
- * config directory that points outside it is rejected, not merely a lexical
- * `..` escape. Fails closed: an unknown name, an escaping path, or an
- * unreadable file returns null rather than a partial list.
+ * A path may be absolute or relative, may leave the config directory, and may
+ * be a symlink: like the contract's `path` source, none of that is a privilege
+ * boundary, and prompts are legitimately kept elsewhere and linked or named
+ * into the agent directory. Reading fails closed per attempt: the first
+ * unreadable prompt reports its own path and no partial list is returned.
  */
 
-import * as fs from "node:fs";
 import * as path from "node:path";
 import { materialize } from "./source.ts";
 
-function isNotFound(error: unknown): boolean {
-	const code = (error as NodeJS.ErrnoException | undefined)?.code;
-	return code === "ENOENT" || code === "ENOTDIR";
+export type PromptFailure =
+	| { kind: "unmapped-import"; name: string }
+	| { kind: "unreadable-prompt"; path: string };
+
+export type PromptOutcome =
+	| { value: string[]; failure?: undefined }
+	| { value?: undefined; failure: PromptFailure };
+
+/** Resolve `rel` against `configDir`; an absolute `rel` is taken as it is. */
+export function resolveImportPath(rel: string, configDir: string): string {
+	return path.isAbsolute(rel) ? rel : path.resolve(configDir, rel);
 }
 
-/**
- * Canonicalize `target`, walking up to the nearest existing ancestor when
- * parts of it do not exist yet. Every existing tail component is `lstat`ed: a
- * symlink that `realpath` could not follow (a dangling link) is rejected
- * rather than re-appended unresolved, since following it could escape.
- */
-function nearestExistingReal(target: string): string | null {
-	let node = target;
-	const tail: string[] = [];
-	for (;;) {
-		let real: string;
-		try {
-			real = fs.realpathSync(node);
-		} catch (error) {
-			if (!isNotFound(error)) return null;
-			const parent = path.dirname(node);
-			if (parent === node) return null;
-			tail.push(path.basename(node));
-			node = parent;
-			continue;
-		}
-		const ordered = tail.toReversed();
-		let probe = node;
-		for (const name of ordered) {
-			probe = path.join(probe, name);
-			try {
-				if (fs.lstatSync(probe).isSymbolicLink()) return null;
-			} catch (error) {
-				if (!isNotFound(error)) return null;
-			}
-		}
-		return ordered.length === 0 ? real : path.join(real, ...ordered);
-	}
-}
-
-/** Resolve `rel` under `configDir` to a canonical path, or null when it escapes. */
-export function resolveImportPath(
-	rel: string,
-	configDir: string,
-): string | null {
-	if (!rel || path.isAbsolute(rel)) return null;
-	let root: string;
-	try {
-		root = fs.realpathSync(configDir);
-	} catch {
-		return null;
-	}
-	const resolved = nearestExistingReal(path.join(root, rel));
-	if (resolved === null) return null;
-	if (resolved !== root && !resolved.startsWith(root + path.sep)) return null;
-	return resolved;
-}
-
-/** Resolve every name to its canonical path in order; null on an unmapped name or an escape. */
+/** Resolve every name in order; an unmapped name reports itself. */
 export function resolvePromptPaths(
 	names: string[],
 	imports: Record<string, string>,
 	configDir: string,
-): string[] | null {
+): PromptOutcome {
 	const paths: string[] = [];
 	for (const name of names) {
 		const rel = imports[name];
-		if (!rel) return null;
-		const resolved = resolveImportPath(rel, configDir);
-		if (!resolved) return null;
-		paths.push(resolved);
+		if (!rel) return { failure: { kind: "unmapped-import", name } };
+		paths.push(resolveImportPath(rel, configDir));
 	}
-	return paths;
+	return { value: paths };
 }
 
-/** Read every already-resolved path in order, via the shared source materializer. */
-export function loadPrompts(paths: string[]): string[] | null {
+/** Read every resolved path in order; the first unreadable one reports itself. */
+export function loadPrompts(paths: string[]): PromptOutcome {
 	const prompts: string[] = [];
 	for (const resolved of paths) {
 		const text = materialize({ kind: "path", path: resolved });
-		if (text === null) return null;
+		if (text === null) {
+			return { failure: { kind: "unreadable-prompt", path: resolved } };
+		}
 		prompts.push(text);
 	}
-	return prompts;
+	return { value: prompts };
 }

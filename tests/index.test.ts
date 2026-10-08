@@ -20,6 +20,7 @@ import factory, {
 	blockKey,
 	configSegment,
 	createBlockLoader,
+	usesMergeBranch,
 } from "../index.ts";
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
@@ -70,8 +71,8 @@ function capture() {
 	return { pi, handlers, bus };
 }
 
-const CAPABLE = { model: { compat: { supportsMidConvoSystemMessages: true } } };
-const INCAPABLE = { model: { compat: { supportsMidConvoSystemMessages: false } } };
+const CAPABLE = { model: { compat: { supportsMidConvoSystemMessages: true } }, hasUI: false };
+const INCAPABLE = { model: { compat: { supportsMidConvoSystemMessages: false } }, hasUI: false };
 
 const created: string[] = [];
 const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -176,6 +177,47 @@ describe("entry assembly", () => {
 		).toBeUndefined();
 	});
 
+	test("reports a present config that yields no block, once", () => {
+		const dir = scratchDir("tail-prompt-broken-");
+		fs.writeFileSync(
+			path.join(dir, "tail-prompt.yaml"),
+			["role: system", "applyment:", "  - missing", ""].join("\n"),
+		);
+		process.env.PI_CODING_AGENT_DIR = dir;
+		delete process.env.PI_SUBAGENT_CHILD;
+		const { handlers } = load();
+		const notices: string[] = [];
+		const ctx = {
+			...CAPABLE,
+			hasUI: true,
+			ui: { notify: (message: string) => notices.push(message) },
+		};
+		const call = () =>
+			handlers.before_provider_request[0](
+				{ payload: { messages: [{ role: "user", content: "u" }] } },
+				ctx,
+			);
+		call();
+		call();
+		expect(notices).toHaveLength(1);
+		expect(notices[0]).toContain("missing");
+	});
+
+	test("a missing configuration file is not reported", () => {
+		process.env.PI_CODING_AGENT_DIR = scratchDir("tail-prompt-none-");
+		delete process.env.PI_SUBAGENT_CHILD;
+		const { handlers } = load();
+		const notices: string[] = [];
+		handlers.before_provider_request[0](
+			{ payload: { messages: [{ role: "user", content: "u" }] } },
+			{
+				...CAPABLE,
+				hasUI: true,
+				ui: { notify: (message: string) => notices.push(message) },
+			},
+		);
+		expect(notices).toHaveLength(0);
+	});
 	test("a subagent session uses the child applyment profile", () => {
 		const dir = scratchDir("tail-prompt-subagent-");
 		fs.mkdirSync(path.join(dir, "system-prompts"));
@@ -269,8 +311,20 @@ describe("segment registration", () => {
 		const bad = { id: "", position: 1, source: { kind: "text", text: "bad" } };
 		bus.emit("tail-prompt:register", bad);
 		bus.emit("tail-prompt:register", bad);
-		expect(block(handlers)).toBe("BLOCK-A");
-		expect(bus.errors).toHaveLength(1);
+		const notices: string[] = [];
+		const ctx = {
+			...CAPABLE,
+			hasUI: true,
+			ui: { notify: (message: string) => notices.push(message) },
+		};
+		const call = () =>
+			handlers.before_provider_request[0](
+				{ payload: { messages: [{ role: "user", content: "u" }] } },
+				ctx,
+			) as { messages: Array<Record<string, unknown>> };
+		expect(String(call().messages[0].content)).toBe("BLOCK-A");
+		call();
+		expect(notices).toHaveLength(1);
 	});
 
 	test("a path segment tracks its file with no further registration", () => {
@@ -336,23 +390,24 @@ describe("block loader", () => {
 		};
 		const load = createBlockLoader(
 			{
-				readConfig: () => ({ parsed, stamp: "cfg" }),
+				readConfig: () => ({ parsed, stamp: "cfg", error: null }),
 				session: () => "main",
 				applyment: (config) => config.applyment,
-				resolvePaths: () => ["/a"],
+				resolvePaths: () => ({ value: ["/a"] }),
 				readPrompts: () => {
 					reads += 1;
-					return ["BODY"];
+					return { value: ["BODY"] };
 				},
 				fileStamp: () => promptStamp,
 			},
 			"/agent",
 		);
-		expect(load()).toEqual({ role: "system", block: "BODY" });
-		expect(load()).toEqual({ role: "system", block: "BODY" });
+		expect(load()).toEqual({ config: { role: "system", block: "BODY" }, failure: null });
+		expect(load()).toEqual({ config: { role: "system", block: "BODY" }, failure: null });
 		expect(reads).toBe(1);
 		promptStamp = "p2";
-		expect(load()).toEqual({ role: "system", block: "BODY" });
+		expect(load()).toEqual({ config: { role: "system", block: "BODY" }, failure: null });
 		expect(reads).toBe(2);
 	});
 });
+
