@@ -22,7 +22,12 @@ import {
 	type ExtensionAPI,
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import type { ParsedTailYaml } from "./config.ts";
+import {
+	resolveRole,
+	type ParsedTailYaml,
+	type Role,
+	type RoleRule,
+} from "./config.ts";
 import {
 	createConfigReader,
 	fileStamp,
@@ -60,7 +65,8 @@ const READY_CHANNEL = "tail-prompt:ready";
 const REPORTED_LIMIT = 64;
 
 export interface TailConfig {
-	role: "system" | "user";
+	role: Role;
+	roleRules: RoleRule[];
 	block: string;
 }
 
@@ -68,6 +74,7 @@ export type LoadResult = {
 	config: TailConfig | null;
 	/** The cause when a present config yields no block; null when there is nothing to inject. */
 	failure: BlockFailure | null;
+	warnings: string[];
 };
 
 /** The pieces the block loader reads through, so it can be exercised directly. */
@@ -114,9 +121,10 @@ export function createBlockLoader(
 	let cache: { key: string; result: LoadResult } | null = null;
 	return () => {
 		const { parsed, stamp, error } = deps.readConfig();
+		const warnings = parsed?.warnings ?? [];
 		const configKey = `cfg:${stamp}`;
 		const remember = (key: string, failure: BlockFailure | null): LoadResult => {
-			const result: LoadResult = { config: null, failure };
+			const result: LoadResult = { config: null, failure, warnings };
 			cache = { key, result };
 			return result;
 		};
@@ -143,36 +151,42 @@ export function createBlockLoader(
 		if (cache && cache.key === key) return cache.result;
 		const read = deps.readPrompts(paths);
 		const result: LoadResult = read.failure
-			? { config: null, failure: read.failure }
+			? { config: null, failure: read.failure, warnings }
 			: {
-					config: { role: parsed.role, block: read.value.join("\n\n") },
+					config: {
+						role: parsed.role,
+						roleRules: parsed.roleRules,
+						block: read.value.join("\n\n"),
+					},
 					failure: null,
+					warnings,
 				};
 		cache = { key, result };
 		return result;
 	};
 }
 
-/** The delivered block and its role, or null when nothing contributes. */
+/** The delivered block and its resolved role, or null when nothing contributes. */
 export function buildBlock(
 	result: LoadResult,
 	registry: SegmentRegistry,
-): { block: string; role: "system" | "user" } | null {
+	modelId: string | undefined,
+): { block: string; role: Role } | null {
 	if (!result.config) return null;
 	const block = registry.assemble([configSegment(result.config.block)]);
 	if (block === null) return null;
-	return { block, role: result.config.role };
+	return { block, role: resolveRole(result.config, modelId) };
 }
 
 /**
  * Merge only when tail insertion would be illegal: the model lacks
- * mid-conversation system support and the configured role is `system`. The
+ * mid-conversation system support and the injected role is `system`. The
  * model's protocol takes no part in this decision; it only distinguishes the
  * payload shapes once the tail branch owns the request (payload.ts).
  */
 export function usesMergeBranch(
 	supportsMidConvoSystemMessages: boolean,
-	role: "system" | "user",
+	role: Role,
 ): boolean {
 	return !supportsMidConvoSystemMessages && role === "system";
 }
@@ -258,9 +272,12 @@ export default function (pi: ExtensionAPI) {
 	// ready signal asks it to re-send, so either load order takes effect.
 	pi.events.emit(READY_CHANNEL, undefined);
 
-	/** Load, surface any failure, and hand the result to the caller. */
+	/** Load, surface any failure or warning, and hand the result to the caller. */
 	const deliver = (ctx: ExtensionContext): LoadResult => {
 		const result = load();
+		for (const warning of result.warnings) {
+			note(`role-rule:${warning}`, `tail-prompt: ${warning}`);
+		}
 		if (result.failure) {
 			note(failureKey(result.failure), failureMessage(result.failure));
 		}
@@ -278,7 +295,7 @@ export default function (pi: ExtensionAPI) {
 	// Pi's official route; a transcript-borne system message would be dropped
 	// by the provider layer.
 	pi.on("before_agent_start", (event, ctx) => {
-		const built = buildBlock(deliver(ctx), registry);
+		const built = buildBlock(deliver(ctx), registry, ctx.model?.id);
 		if (!built) return;
 		if (
 			!usesMergeBranch(
@@ -297,7 +314,7 @@ export default function (pi: ExtensionAPI) {
 	// Tail branch: tail insertion is legal, so insert the block into the final
 	// payload adjacent to the latest user turn.
 	pi.on("before_provider_request", (event, ctx) => {
-		const built = buildBlock(deliver(ctx), registry);
+		const built = buildBlock(deliver(ctx), registry, ctx.model?.id);
 		if (!built) return;
 		const merge = usesMergeBranch(
 			supportsMidConvoSystemMessages(ctx.model),

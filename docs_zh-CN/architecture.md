@@ -11,10 +11,12 @@
 
 | 分支 | 条件 | 机制 |
 | --- | --- | --- |
-| `tail` | 协议支持中段系统提示词 / `role: "user"` | `before_provider_request`：把块插入最终载荷，紧贴最新一条用户消息 |
-| `merge` | 协议不支持中段系统提示词且 `role: "system"` | `before_agent_start`：通过 `systemPromptOptions.appendSystemPrompt` 追加到顶部系统提示词 |
+| `tail` | 协议支持中段系统提示词 / `role` 为 `user` | `before_provider_request`：把块插入最终载荷，紧贴最新一条用户消息 |
+| `merge` | 协议不支持中段系统提示词且 `role` 为 `system` | `before_agent_start`：通过 `systemPromptOptions.appendSystemPrompt` 追加到顶部系统提示词 |
 
 > `merge` 分支不碰载荷，遵循 Pi 官方系统提示词修改途径。
+
+`role` 指 `roleRules` 解析后的最终角色。
 
 ### tail 的落位
 
@@ -62,6 +64,9 @@
 起因经 Pi 的 UI 通知上报，同一原因只报一次；无 UI 时上报不发生。
 配置文件不存在不算失败，不上报。
 
+无效的 `roleRules` 条目不构成失败：该条目被跳过并警告，其余条目与块照常生效。
+警告指明该条目在 `roleRules` 中的顺序位置。
+
 ## 缓存
 
 配置读取按配置文件的 `mtime:size`；块按「配置文件的 stamp 与全部提示词文件的 stamp 拼接」为键复用。
@@ -72,7 +77,7 @@
 
 | 模块 | 职责 |
 | --- | --- |
-| `index.ts` | 装配：注册钩子与总线监听，选择分支，上报失败 |
+| `index.ts` | 装配：注册钩子与总线监听，选择分支，上报失败与警告 |
 | `failure.ts` | 关闭的失败起因集合及其用户文案 |
 | `segments.ts` | 段注册表与注册校验 |
 | `source.ts` | 段来源物化：读绝对路径，或取文本值 |

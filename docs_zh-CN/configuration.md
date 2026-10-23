@@ -10,6 +10,7 @@
 | 键 | 值 |
 | --- | --- |
 | `role` | 注入角色的声明，见下 |
+| `roleRules` | 注入角色的匹配规则，匹配对象是模型 ID |
 | `imports` | 名称 → 提示词文件 |
 | `applyment` | 主会话的提示词清单，按此顺序装配 |
 | `profiles.subagent.applyment` | 子会话的提示词清单 |
@@ -23,6 +24,8 @@
 
 ```yaml
 role: system
+roleRules:
+  ".*deepseek.*": user
 imports:
   contract: system-prompts/working-contract.txt
   decompose: system-prompts/decompose-thinking.txt
@@ -41,6 +44,16 @@ profiles:
 | --- | --- |
 | `system` | 提示词以 system 角色的轮次落位 |
 | `user` | 默认；提示词以用户角色的轮次落位，模型不支持会话中段 system 时也能留在尾部 |
+
+## `roleRules`
+
+该参数输入键值对。
+键为**正则表达式**，值为 `role` 的合法值。
+
+从上到下顺序检测，匹配成功则使用对应角色。
+全部不成功则使用 `role` 设置的值。
+
+空键与无效条目会被跳过并警告。
 
 ## `imports`
 

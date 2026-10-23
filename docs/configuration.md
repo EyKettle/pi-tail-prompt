@@ -10,6 +10,7 @@ English | [中文](../docs_zh-CN/configuration.md)
 | Key | Value |
 | --- | --- |
 | `role` | the injected role, see below |
+| `roleRules` | role matching rules against the model ID, see below |
 | `imports` | name → prompt file |
 | `applyment` | the main session's prompt list |
 | `profiles.subagent.applyment` | the subagent session's list |
@@ -24,6 +25,8 @@ Example file contents:
 
 ```yaml
 role: system
+roleRules:
+  ".*deepseek.*": user
 imports:
   contract: system-prompts/working-contract.txt
   decompose: system-prompts/decompose-thinking.txt
@@ -44,6 +47,14 @@ profiles:
 | `user` | default; the prompt takes a user-role turn |
 
 A `user` prompt can stay at the tail even on a model that takes no mid-conversation system message.
+
+## `roleRules`
+
+The value is a key-value map.
+Each key is a regular expression; each value is a valid `role`.
+Rules are checked from top to bottom; the first match sets the role.
+When none matches, `role` applies.
+Empty keys and invalid entries are skipped with a warning.
 
 ## `imports`
 

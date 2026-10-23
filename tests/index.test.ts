@@ -126,6 +126,28 @@ function scratchAgentDir(): string {
 	return dir;
 }
 
+function roleRulesAgentDir(rules: string[], role = "system"): string {
+	const dir = scratchDir("tail-prompt-rules-");
+	fs.mkdirSync(path.join(dir, "system-prompts"));
+	fs.writeFileSync(path.join(dir, "system-prompts", "a.txt"), "BLOCK-A\n");
+	fs.writeFileSync(
+		path.join(dir, "tail-prompt.yaml"),
+		[
+			`role: ${role}`,
+			"roleRules:",
+			...rules,
+			"imports:",
+			"  a: system-prompts/a.txt",
+			"applyment:",
+			"  - a",
+			"",
+		].join("\n"),
+	);
+	process.env.PI_CODING_AGENT_DIR = dir;
+	delete process.env.PI_SUBAGENT_CHILD;
+	return dir;
+}
+
 function load() {
 	const { pi, handlers, bus } = capture();
 	factory(pi as unknown as ExtensionAPI);
@@ -314,6 +336,129 @@ describe("entry assembly", () => {
 	});
 });
 
+
+describe("role rules", () => {
+	test("a matching rule decides the injected role", () => {
+		roleRulesAgentDir(['  "^deepseek": user']);
+		const { handlers } = load();
+		const out = handlers.before_provider_request[0](
+			{ payload: { messages: [{ role: "user", content: "u" }] } },
+			{
+				model: {
+					id: "deepseek-chat",
+					compat: { supportsMidConvoSystemMessages: false },
+				},
+				hasUI: false,
+			},
+		) as { messages: Array<Record<string, unknown>> };
+		expect(out.messages).toEqual([
+			{ role: "user", content: "BLOCK-A" },
+			{ role: "user", content: "u" },
+		]);
+	});
+
+	test("a matching rule can select the merge branch", () => {
+		roleRulesAgentDir(['  "^gpt": system'], "user");
+		const { handlers } = load();
+		const model = {
+			id: "gpt-5",
+			compat: { supportsMidConvoSystemMessages: false },
+		};
+		expect(promptOptions(handlers, model).appendSystemPrompt).toBe("BLOCK-A");
+		expect(
+			handlers.before_provider_request[0](
+				{ payload: { messages: [{ role: "user", content: "u" }] } },
+				{ model, hasUI: false },
+			),
+		).toBeUndefined();
+	});
+
+	test("an unmatched model falls back to the configured role", () => {
+		roleRulesAgentDir(['  "^deepseek": system'], "user");
+		const { handlers } = load();
+		const out = handlers.before_provider_request[0](
+			{ payload: { messages: [{ role: "user", content: "u" }] } },
+			{
+				model: {
+					id: "gpt-5",
+					compat: { supportsMidConvoSystemMessages: false },
+				},
+				hasUI: false,
+			},
+		) as { messages: Array<Record<string, unknown>> };
+		expect(out.messages[0]).toEqual({ role: "user", content: "BLOCK-A" });
+	});
+
+	test("the first matching rule wins", () => {
+		roleRulesAgentDir(
+			['  "deepseek": system', '  "deepseek-chat": user'],
+			"user",
+		);
+		const { handlers } = load();
+		const model = {
+			id: "deepseek-chat",
+			compat: { supportsMidConvoSystemMessages: false },
+		};
+		expect(promptOptions(handlers, model).appendSystemPrompt).toBe("BLOCK-A");
+	});
+
+	test("an invalid rule warns once and the block still delivers", () => {
+		roleRulesAgentDir(['  "": user', '  "^deepseek": user']);
+		const { handlers } = load();
+		const notices: string[] = [];
+		const ctx = {
+			model: {
+				id: "deepseek-chat",
+				compat: { supportsMidConvoSystemMessages: false },
+			},
+			hasUI: true,
+			ui: { notify: (message: string) => notices.push(message) },
+		};
+		const call = () =>
+			handlers.before_provider_request[0](
+				{ payload: { messages: [{ role: "user", content: "u" }] } },
+				ctx,
+			) as { messages: Array<Record<string, unknown>> };
+		expect(call().messages[0]).toEqual({ role: "user", content: "BLOCK-A" });
+		call();
+		expect(notices).toEqual([
+			"tail-prompt: roleRules[1] skipped: empty pattern",
+		]);
+	});
+
+	test("a rule-selected system role takes the developer identity", () => {
+		roleRulesAgentDir(['  "^gpt": system'], "user");
+		const { handlers } = load();
+		const ctx = {
+			model: {
+				id: "gpt-5",
+				api: "openai-completions",
+				reasoning: true,
+				compat: {
+					supportsMidConvoSystemMessages: true,
+					supportsDeveloperRole: true,
+				},
+			},
+			hasUI: false,
+		};
+		const out = handlers.before_provider_request[0](
+			{
+				payload: {
+					messages: [
+						{ role: "system", content: "S" },
+						{ role: "user", content: "u" },
+					],
+				},
+			},
+			ctx,
+		) as { messages: Array<Record<string, unknown>> };
+		expect(out.messages[1]).toEqual({
+			role: "developer",
+			content: "BLOCK-A",
+		});
+	});
+});
+
 describe("segment registration", () => {
 	test("emits the ready signal with no payload", () => {
 		scratchAgentDir();
@@ -442,6 +587,8 @@ describe("block loader cache", () => {
 				readConfig: () => ({
 					parsed: {
 						role: "system",
+						roleRules: [],
+						warnings: [],
 						imports: { a: "/a" },
 						applyment: ["a"],
 						subagentApplyment: undefined,
@@ -465,11 +612,13 @@ describe("block loader cache", () => {
 		expect(loader()).toEqual({
 			config: null,
 			failure: { kind: "unreadable-prompt", path: "/a" },
+			warnings: [],
 		});
 		promptStamp = "p2";
 		expect(loader()).toEqual({
-			config: { role: "system", block: "BODY" },
+			config: { role: "system", roleRules: [], block: "BODY" },
 			failure: null,
+			warnings: [],
 		});
 		expect(reads).toBe(2);
 	});

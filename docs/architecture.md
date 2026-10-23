@@ -12,8 +12,10 @@ The branch follows the model protocol's compatibility.
 
 | Branch | Condition |
 | --- | --- |
-| `tail` | protocol support, or `role: "user"` |
-| `merge` | no support, and `role: "system"` |
+| `tail` | protocol support, or `role` is `user` |
+| `merge` | no support, and `role` is `system` |
+
+`role` is the final role resolved through `roleRules`.
 
 `tail` runs at `before_provider_request`: it inserts the block into the final payload, adjacent to the latest user message.
 `merge` runs at `before_agent_start`: it appends the block to the leading system prompt through `systemPromptOptions.appendSystemPrompt`.
@@ -67,6 +69,9 @@ When the configuration exists but no block can be assembled, the cause comes fro
 The cause is reported through Pi's UI notification, once per cause; with no UI the report does not happen.
 A missing configuration file is not a failure and is not reported.
 
+Invalid `roleRules` entries are not failures: each is skipped with a warning, and the remaining entries and the block still apply.
+The warning names the rule's position in `roleRules`.
+
 ## Cache
 
 Configuration reading is keyed by the configuration file's `mtime:size`; the block is reused under the key formed by joining the configuration file's stamp with every prompt file's stamp.
@@ -78,7 +83,7 @@ Prompt-level failures are remembered under a key that includes the prompt stamps
 
 | Module | Responsibility |
 | --- | --- |
-| `index.ts` | assembly: hooks, bus listener, branch, reporting |
+| `index.ts` | assembly: hooks, bus listener, branch, reporting failures and warnings |
 | `failure.ts` | the closed failure set and its wording |
 | `segments.ts` | the segment registry and validation |
 | `source.ts` | segment source materialization |
