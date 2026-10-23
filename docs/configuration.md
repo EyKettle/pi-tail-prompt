@@ -40,8 +40,8 @@ profiles:
 
 | Value | Effect |
 | --- | --- |
-| `system` | default |
-| `user` | the prompt takes a user-role turn |
+| `system` | the prompt takes a system-role turn |
+| `user` | default; the prompt takes a user-role turn |
 
 A `user` prompt can stay at the tail even on a model that takes no mid-conversation system message.
 

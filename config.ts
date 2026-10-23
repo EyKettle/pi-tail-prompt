@@ -3,9 +3,8 @@
  * subset the extension uses: `role`, `imports`, `applyment`, and
  * `profiles.subagent.applyment`.
  *
- * Parsing fails closed: an unknown `role` value is rejected rather than
- * silently defaulted to `system`. Reading the file and caching the parse live
- * in config-file.ts, its own change driver.
+ * Parsing fails closed: an unknown `role` value is rejected. Reading the
+ * file and caching the parse live in config-file.ts, its own change driver.
  */
 
 export type ParsedTailYaml = {
@@ -17,6 +16,8 @@ export type ParsedTailYaml = {
 
 /** The only profile name the schema recognizes. */
 const SUBAGENT_PROFILE = "subagent";
+
+const DEFAULT_ROLE: ParsedTailYaml["role"] = "user";
 
 /** Remove a trailing `#` comment; a `#` at line start or after whitespace starts one. */
 function stripComment(line: string): string {
@@ -35,7 +36,7 @@ function parseRole(lines: readonly string[]): "system" | "user" {
 		if (value === "user" || value === "system") return value;
 		throw new Error(`unknown role '${value}': expected 'system' or 'user'`);
 	}
-	return "system";
+	return DEFAULT_ROLE;
 }
 
 function parseImportsEntry(line: string): [string, string] | null {

@@ -15,8 +15,8 @@ describe("parseConfig", () => {
 		expect(parsed.subagentApplyment).toEqual(["decompose", "child-contract"]);
 	});
 
-	test("defaults role to system when absent", () => {
-		expect(parseConfig("applyment:\n  - decompose\n").role).toBe("system");
+	test("defaults role to user when absent", () => {
+		expect(parseConfig("applyment:\n  - decompose\n").role).toBe("user");
 	});
 
 	test("rejects an unknown role value", () => {
