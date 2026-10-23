@@ -196,6 +196,16 @@ function truncate(text: string, limit = 120): string {
 	return text.length <= limit ? text : `${text.slice(0, limit - 1)}…`;
 }
 
+/**
+ * Append the block to whatever `appendSystemPrompt` already carries.
+ *
+ * The host normalizes that field to a string, so an empty value is the only
+ * case that needs a different join: no separator before the first block.
+ */
+function appendBlock(existing: string, block: string): string {
+	return existing.length === 0 ? block : `${existing}\n\n${block}`;
+}
+
 export default function (pi: ExtensionAPI) {
 	const agentDir = getAgentDir();
 	const registry = new SegmentRegistry();
@@ -266,9 +276,11 @@ export default function (pi: ExtensionAPI) {
 		deliver(ctx);
 	});
 
-	// Merge branch: tail insertion is illegal, so append a request-local system
-	// message and let Pi fold it into the leading prompt.
-	pi.on("context_with_system", (event, ctx) => {
+	// Merge branch: the leading system prompt is the only placement a protocol
+	// without mid-conversation system messages preserves. Appending there is
+	// Pi's official route; a transcript-borne system message would be dropped
+	// by the provider layer.
+	pi.on("before_agent_start", (event, ctx) => {
 		const built = buildBlock(deliver(ctx), registry);
 		if (!built) return;
 		if (
@@ -279,12 +291,10 @@ export default function (pi: ExtensionAPI) {
 		) {
 			return;
 		}
-		return {
-			messages: [
-				...event.messages,
-				{ role: "system", content: built.block, timestamp: Date.now() },
-			],
-		};
+		event.systemPromptOptions.appendSystemPrompt = appendBlock(
+			event.systemPromptOptions.appendSystemPrompt,
+			built.block,
+		);
 	});
 
 	// Tail branch: tail insertion is legal, so insert the block into the final
@@ -297,8 +307,8 @@ export default function (pi: ExtensionAPI) {
 			built.role,
 		);
 		const payload = event.payload as Record<string, unknown> | undefined;
-		// The merge configuration delivered the block through the transcript;
-		// this hook must leave the payload untouched then.
+		// The merge configuration delivered the block through the prompt; this
+		// hook must leave the payload untouched then.
 		if (!payload || merge) return;
 		const placed = applyTailToPayload(
 			payload,

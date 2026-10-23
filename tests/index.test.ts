@@ -129,6 +129,20 @@ function block(handlers: Record<string, Handler[]>): string {
 	return String(out.messages[0].content);
 }
 
+/** Run the `before_agent_start` handler and return the prompt options it saw. */
+function promptOptions(
+	handlers: Record<string, Handler[]>,
+	model: Record<string, unknown>,
+	initial = "",
+): { appendSystemPrompt: string } {
+	const options = { appendSystemPrompt: initial };
+	handlers.before_agent_start[0](
+		{ systemPrompt: "", systemPromptOptions: options },
+		{ model, hasUI: false },
+	);
+	return options;
+}
+
 describe("entry assembly", () => {
 	test("reads the configuration from the agent-directory override", () => {
 		scratchAgentDir();
@@ -146,35 +160,32 @@ describe("entry assembly", () => {
 	test("capable model: the tail branch injects, the merge branch is inert", () => {
 		scratchAgentDir();
 		const { handlers } = load();
-		expect(
-			handlers.context_with_system[0](
-				{ messages: [{ role: "user", content: "u" }] },
-				CAPABLE,
-			),
-		).toBeUndefined();
+		expect(promptOptions(handlers, CAPABLE.model).appendSystemPrompt).toBe(
+			"",
+		);
 		expect(block(handlers)).toBe("BLOCK-A");
 	});
 
 	test("incapable model: the merge branch appends the block, the tail branch is inert", () => {
 		scratchAgentDir();
 		const { handlers } = load();
-		const out = handlers.context_with_system[0](
-			{ messages: [{ role: "user", content: "u" }] },
-			INCAPABLE,
-		) as { messages: Array<Record<string, unknown>> };
-		expect(out.messages).toHaveLength(2);
-		expect(out.messages[0]).toEqual({ role: "user", content: "u" });
-		expect(out.messages[1]).toEqual({
-			role: "system",
-			content: "BLOCK-A",
-			timestamp: expect.any(Number),
-		});
+		expect(
+			promptOptions(handlers, INCAPABLE.model).appendSystemPrompt,
+		).toBe("BLOCK-A");
 		expect(
 			handlers.before_provider_request[0](
 				{ payload: { messages: [{ role: "user", content: "u" }] } },
 				INCAPABLE,
 			),
 		).toBeUndefined();
+	});
+
+	test("the merge branch appends after an existing append-system prompt", () => {
+		scratchAgentDir();
+		const { handlers } = load();
+		expect(
+			promptOptions(handlers, INCAPABLE.model, "BASE").appendSystemPrompt,
+		).toBe("BASE\n\nBLOCK-A");
 	});
 
 	test("reports a present config that yields no block, once", () => {
@@ -218,6 +229,7 @@ describe("entry assembly", () => {
 		);
 		expect(notices).toHaveLength(0);
 	});
+
 	test("a subagent session uses the child applyment profile", () => {
 		const dir = scratchDir("tail-prompt-subagent-");
 		fs.mkdirSync(path.join(dir, "system-prompts"));
@@ -244,10 +256,14 @@ describe("entry assembly", () => {
 		const { handlers } = load();
 		expect(block(handlers)).toBe("CHILD");
 	});
-	test("no child-identity splice registration remains", () => {
+
+	test("the merge branch uses the prompt path, not a transcript message", () => {
 		scratchAgentDir();
 		const { handlers } = load();
-		expect(handlers.before_agent_start).toBeUndefined();
+		// The block must reach the model through the prompt path, not as a
+		// transcript message the provider layer would drop.
+		expect(handlers.context_with_system).toBeUndefined();
+		expect(handlers.before_agent_start).toBeDefined();
 	});
 
 	test("no configuration: nothing is delivered on either branch", () => {
@@ -260,12 +276,9 @@ describe("entry assembly", () => {
 				CAPABLE,
 			),
 		).toBeUndefined();
-		expect(
-			handlers.context_with_system[0](
-				{ messages: [{ role: "user", content: "u" }] },
-				INCAPABLE,
-			),
-		).toBeUndefined();
+		expect(promptOptions(handlers, INCAPABLE.model).appendSystemPrompt).toBe(
+			"",
+		);
 	});
 });
 
@@ -295,14 +308,14 @@ describe("segment registration", () => {
 		bus.emit("tail-prompt:register", {
 			id: "x",
 			position: 1,
-			source: { kind: "text", text: "old" },
+			source: { kind: "text", text: "SEG" },
 		});
 		bus.emit("tail-prompt:register", {
 			id: "x",
 			position: 1,
-			source: { kind: "text", text: "new" },
+			source: { kind: "text", text: "SEG2" },
 		});
-		expect(block(handlers)).toBe("new\n\nBLOCK-A");
+		expect(block(handlers)).toBe("SEG2\n\nBLOCK-A");
 	});
 
 	test("an invalid registration is dropped, reported once, and interrupts nothing", () => {
@@ -321,26 +334,40 @@ describe("segment registration", () => {
 			handlers.before_provider_request[0](
 				{ payload: { messages: [{ role: "user", content: "u" }] } },
 				ctx,
-			) as { messages: Array<Record<string, unknown>> };
-		expect(String(call().messages[0].content)).toBe("BLOCK-A");
+			);
+		expect(block(handlers)).toBe("BLOCK-A");
+		call();
 		call();
 		expect(notices).toHaveLength(1);
 	});
 
 	test("a path segment tracks its file with no further registration", () => {
-		scratchAgentDir();
-		const { handlers, bus } = load();
 		const dir = scratchDir("tail-prompt-seg-");
-		const file = path.join(dir, "seg.txt");
-		fs.writeFileSync(file, "ONE\n");
+		fs.mkdirSync(path.join(dir, "system-prompts"));
+		fs.writeFileSync(path.join(dir, "system-prompts", "a.txt"), "BLOCK-A\n");
+		fs.writeFileSync(path.join(dir, "seg.txt"), "SEG\n");
+		fs.writeFileSync(
+			path.join(dir, "tail-prompt.yaml"),
+			[
+				"role: system",
+				"imports:",
+				"  a: system-prompts/a.txt",
+				"applyment:",
+				"  - a",
+				"",
+			].join("\n"),
+		);
+		process.env.PI_CODING_AGENT_DIR = dir;
+		delete process.env.PI_SUBAGENT_CHILD;
+		const { handlers, bus } = load();
 		bus.emit("tail-prompt:register", {
 			id: "p",
 			position: 1,
-			source: { kind: "path", path: file },
+			source: { kind: "path", path: path.join(dir, "seg.txt") },
 		});
-		expect(block(handlers)).toBe("ONE\n\nBLOCK-A");
-		fs.writeFileSync(file, "TWO\n");
-		expect(block(handlers)).toBe("TWO\n\nBLOCK-A");
+		expect(block(handlers)).toBe("SEG\n\nBLOCK-A");
+		fs.writeFileSync(path.join(dir, "seg.txt"), "SEG-EDITED\n");
+		expect(block(handlers)).toBe("SEG-EDITED\n\nBLOCK-A");
 	});
 });
 
@@ -348,8 +375,8 @@ describe("registration load order", () => {
 	test("a contributor that loaded first registers through the ready signal", () => {
 		scratchAgentDir();
 		const { pi, handlers, bus } = capture();
-		// The contributor loads before this extension: its emit reaches no
-		// subscriber, so it subscribes to ready and re-sends on receipt.
+		// The contributor emits before tail-prompt subscribes, so the ready
+		// signal is its only route to registration.
 		const registration = {
 			id: "early",
 			position: 1,
@@ -364,50 +391,64 @@ describe("registration load order", () => {
 	});
 });
 
-describe("block loader", () => {
-	test("blockKey joins the config stamp with every prompt stamp", () => {
-		expect(blockKey("cfg", ["a", "b"], (p) => (p === "a" ? "s1" : "s2"))).toBe(
-			"cfg|s1|s2",
+describe("block loader cache", () => {
+	test("the cache key covers the config stamp and every prompt stamp", () => {
+		const stamps: Record<string, string> = { cfg: "c1", "/a": "p1", "/b": "p2" };
+		const key = blockKey(
+			"c1",
+			["/a", "/b"],
+			(file) => stamps[file] ?? "missing",
 		);
+		expect(key).toBe("c1|p1|p2");
 	});
 
-	test("configSegment is the reserved position-0 text segment", () => {
-		expect(configSegment("BODY")).toEqual({
-			id: "tail-prompt",
-			position: 0,
-			source: { kind: "text", text: "BODY" },
-		});
-	});
-
-	test("createBlockLoader caches by the combined key and reloads when it moves", () => {
-		let promptStamp = "p1";
+	test("a prompt-level failure re-evaluates when the prompt file changes", () => {
 		let reads = 0;
-		const parsed = {
-			role: "system" as const,
-			imports: { a: "a.txt" },
-			applyment: ["a"],
-			subagentApplyment: undefined,
-		};
-		const load = createBlockLoader(
+		let promptStamp = "p1";
+		const loader = createBlockLoader(
 			{
-				readConfig: () => ({ parsed, stamp: "cfg", error: null }),
+				readConfig: () => ({
+					parsed: {
+						role: "system",
+						imports: { a: "/a" },
+						applyment: ["a"],
+						subagentApplyment: undefined,
+					},
+					stamp: "c1",
+					error: null,
+				}),
 				session: () => "main",
-				applyment: (config) => config.applyment,
+				applyment: () => ["a"],
 				resolvePaths: () => ({ value: ["/a"] }),
 				readPrompts: () => {
 					reads += 1;
-					return { value: ["BODY"] };
+					return reads === 1
+						? { failure: { kind: "unreadable-prompt", path: "/a" } }
+						: { value: ["BODY"] };
 				},
 				fileStamp: () => promptStamp,
 			},
 			"/agent",
 		);
-		expect(load()).toEqual({ config: { role: "system", block: "BODY" }, failure: null });
-		expect(load()).toEqual({ config: { role: "system", block: "BODY" }, failure: null });
-		expect(reads).toBe(1);
+		expect(loader()).toEqual({
+			config: null,
+			failure: { kind: "unreadable-prompt", path: "/a" },
+		});
 		promptStamp = "p2";
-		expect(load()).toEqual({ config: { role: "system", block: "BODY" }, failure: null });
+		expect(loader()).toEqual({
+			config: { role: "system", block: "BODY" },
+			failure: null,
+		});
 		expect(reads).toBe(2);
+	});
+
+	test("the configured prompts are the position-zero segment", () => {
+		const segment = configSegment("BODY");
+		expect(segment).toEqual({
+			id: "tail-prompt",
+			position: 0,
+			source: { kind: "text", text: "BODY" },
+		});
 	});
 });
 
@@ -465,12 +506,7 @@ describe("role: user on a model without mid-conversation support", () => {
 			hasUI: false,
 		};
 		// A user block is legal at the tail, so the merge branch stays inert.
-		expect(
-			handlers.context_with_system[0](
-				{ messages: [{ role: "user", content: "u" }] },
-				ctx,
-			),
-		).toBeUndefined();
+		expect(promptOptions(handlers, ctx.model).appendSystemPrompt).toBe("");
 		const out = handlers.before_provider_request[0](
 			{ payload: { messages: [{ role: "user", content: "u" }] } },
 			ctx,
@@ -518,32 +554,27 @@ describe("one placement per request", () => {
 			{ role: "system", content: "S" },
 			{ role: "user", content: "u" },
 		];
-		// 1) The transcript path appends the block for a model without
+		// 1) The prompt path carries the block for a model without
 		// mid-conversation system support.
-		const appended = handlers.context_with_system[0](
-			{ messages: transcript },
+		const options = { appendSystemPrompt: "" };
+		handlers.before_agent_start[0](
+			{ systemPrompt: "", systemPromptOptions: options },
 			INCAPABLE,
-		) as { messages: Array<Record<string, unknown>> };
-		expect(appended).toBeDefined();
-		// 2) Pi collapses such a transcript: the leading system message becomes
-		// the replayed concatenation of every system message, in order.
-		const systems = appended.messages.filter((m) => m.role === "system");
-		const others = appended.messages.filter((m) => m.role !== "system");
+		);
+		expect(options.appendSystemPrompt).toBe("BLOCK-A");
+		// 2) The payload hook must leave such a payload untouched: the merge
+		// configuration already delivered the block through the prompt.
 		const payload = {
 			model: "gpt-5",
 			messages: [
-				{
-					role: "system",
-					content: systems.map((m) => String(m.content)).join("\n\n"),
-				},
-				...others,
+				{ role: "system", content: `S\n\n${options.appendSystemPrompt}` },
+				...transcript.filter((m) => m.role !== "system"),
 			],
 		};
-		// 3) The payload hook must leave this payload untouched.
 		expect(
 			handlers.before_provider_request[0]({ payload }, INCAPABLE),
 		).toBeUndefined();
-		// 4) The block appears exactly once in the folded leading prompt.
+		// 3) The block appears exactly once in the leading prompt.
 		const leading = String(payload.messages[0].content);
 		expect(leading.split("BLOCK-A").length - 1).toBe(1);
 	});
