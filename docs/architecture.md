@@ -34,6 +34,14 @@ When the tail placement does not fit — an unrecognized shape, a missing payloa
 The fields are probed in order: `system`, `systemInstruction`, `messages[0]`, `input[0]`.
 When none of the four exists, the reporting channel states that this request cannot carry the block.
 
+### System identity
+
+On an OpenAI-family protocol with a reasoning model which supports `developer` role, the request uses `developer` role instead of `system`.
+
+A mid-conversation `system` block takes the identity Pi gives a system message on the same request.
+the leading message is read when the declaration is absent, and a Codex Responses request (`instructions`) defaults to `developer`.
+Every other protocol uses `system`.
+
 ## Assembly
 
 The block is assembled once per request, from segments.

@@ -73,6 +73,17 @@ function capture() {
 
 const CAPABLE = { model: { compat: { supportsMidConvoSystemMessages: true } }, hasUI: false };
 const INCAPABLE = { model: { compat: { supportsMidConvoSystemMessages: false } }, hasUI: false };
+const DEVELOPER = {
+	model: {
+		api: "openai-completions",
+		reasoning: true,
+		compat: {
+			supportsMidConvoSystemMessages: true,
+			supportsDeveloperRole: true,
+		},
+	},
+	hasUI: false,
+};
 
 const created: string[] = [];
 const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -178,6 +189,27 @@ describe("entry assembly", () => {
 				INCAPABLE,
 			),
 		).toBeUndefined();
+	});
+
+	test("a reasoning OpenAI model: the tail block takes the developer identity", () => {
+		scratchAgentDir();
+		const { handlers } = load();
+		const out = handlers.before_provider_request[0](
+			{
+				payload: {
+					messages: [
+						{ role: "system", content: "S" },
+						{ role: "user", content: "u" },
+					],
+				},
+			},
+			DEVELOPER,
+		) as { messages: Array<Record<string, unknown>> };
+		expect(out.messages).toEqual([
+			{ role: "system", content: "S" },
+			{ role: "developer", content: "BLOCK-A" },
+			{ role: "user", content: "u" },
+		]);
 	});
 
 	test("the merge branch appends after an existing append-system prompt", () => {

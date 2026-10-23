@@ -32,6 +32,8 @@ import { failureKey, failureMessage, type BlockFailure } from "./failure.ts";
 import {
 	applyTailToPayload,
 	mergeBlockIntoLeadingSystem,
+	midSystemRole,
+	type ModelIdentityView,
 } from "./payload.ts";
 import {
 	loadPrompts,
@@ -67,11 +69,6 @@ export type LoadResult = {
 	/** The cause when a present config yields no block; null when there is nothing to inject. */
 	failure: BlockFailure | null;
 };
-
-interface ModelView {
-	compat?: unknown;
-	api?: unknown;
-}
 
 /** The pieces the block loader reads through, so it can be exercised directly. */
 export interface BlockLoaderDeps {
@@ -180,14 +177,14 @@ export function usesMergeBranch(
 	return !supportsMidConvoSystemMessages && role === "system";
 }
 
-function supportsMidConvoSystemMessages(model: ModelView | undefined): boolean {
+function supportsMidConvoSystemMessages(model: ModelIdentityView | undefined): boolean {
 	const compat = model?.compat as
 		| { supportsMidConvoSystemMessages?: boolean }
 		| undefined;
 	return compat?.supportsMidConvoSystemMessages === true;
 }
 
-function modelApi(model: ModelView | undefined): string | undefined {
+function modelApi(model: ModelIdentityView | undefined): string | undefined {
 	return model?.api === undefined ? undefined : String(model.api);
 }
 
@@ -310,10 +307,14 @@ export default function (pi: ExtensionAPI) {
 		// The merge configuration delivered the block through the prompt; this
 		// hook must leave the payload untouched then.
 		if (!payload || merge) return;
+		const role =
+			built.role === "system"
+				? midSystemRole(ctx.model, payload)
+				: built.role;
 		const placed = applyTailToPayload(
 			payload,
 			built.block,
-			built.role,
+			role,
 			modelApi(ctx.model),
 		);
 		if (placed) return placed;

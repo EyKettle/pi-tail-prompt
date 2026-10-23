@@ -29,6 +29,14 @@
 尾插放不进去时（形状识别不出、载荷缺失），块并入载荷的顶部 system 内容：依次探测 `system`、`systemInstruction`、`messages[0]`、`input[0]`。
 四处都没有时经上报通道说明本次请求无法承载。
 
+### 系统消息身份
+
+匹配 OpenAI 系列协议且模型支持推理时，支持 `developer` 身份的请求会使用 `developer` 身份替代 `system` 身份。
+
+中段 `system` 块采用 Pi 在同一次请求中赋予 system 消息的身份。
+声明缺失时读取头领消息的身份；Codex Responses 请求（`instructions`）默认使用 `developer`。
+其他协议使用 `system`。
+
 ## 装配
 
 每个请求装配一次；块由段装配。

@@ -4,6 +4,7 @@ import {
 	injectAnthropicTail,
 	injectTailPrompt,
 	isAnthropicPayload,
+	midSystemRole,
 } from "../payload.ts";
 
 const system = { role: "system", content: "s" };
@@ -385,5 +386,104 @@ describe("applyTailToPayload (hook routing)", () => {
 		expect((out.input as Array<Record<string, unknown>>).map((m) => m.role)).toEqual([
 			"user",
 		]);
+	});
+
+	test("developer role: the inserted message keeps that identity", () => {
+		const payload = openaiPayload();
+		const out = applyTailToPayload(
+			payload as unknown as Record<string, unknown>,
+			"REMIND",
+			"developer",
+		)!;
+		const messages = out.messages as Array<Record<string, unknown>>;
+		expect(messages[2]).toEqual({ role: "developer", content: "REMIND" });
+	});
+});
+
+
+describe("midSystemRole", () => {
+	const model = (overrides: Record<string, unknown> = {}) => ({
+		api: "openai-completions",
+		reasoning: true,
+		compat: {},
+		...overrides,
+	});
+	const payloadWith = (role: string) => ({
+		messages: [
+			{ role, content: "s" },
+			{ role: "user", content: "u" },
+		],
+	});
+
+	test("an explicit supportsDeveloperRole decides before the payload", () => {
+		expect(
+			midSystemRole(
+				model({ compat: { supportsDeveloperRole: true } }),
+				payloadWith("system"),
+			),
+		).toBe("developer");
+		expect(
+			midSystemRole(
+				model({ compat: { supportsDeveloperRole: false } }),
+				payloadWith("developer"),
+			),
+		).toBe("system");
+	});
+
+	test("without a declaration, follows the leading system identity", () => {
+		expect(midSystemRole(model(), payloadWith("developer"))).toBe("developer");
+		expect(midSystemRole(model(), payloadWith("system"))).toBe("system");
+	});
+
+	test("a non-reasoning model keeps system", () => {
+		expect(
+			midSystemRole(
+				model({
+					reasoning: false,
+					compat: { supportsDeveloperRole: true },
+				}),
+				payloadWith("developer"),
+			),
+		).toBe("system");
+	});
+
+	test("a non-OpenAI protocol keeps system", () => {
+		expect(
+			midSystemRole(
+				model({ api: "anthropic-messages" }),
+				payloadWith("developer"),
+			),
+		).toBe("system");
+	});
+
+	test("Codex Responses: instructions carries the leading prompt", () => {
+		expect(
+			midSystemRole(
+				model({ api: "openai-codex-responses" }),
+				{ instructions: "s", input: [{ role: "user", content: "u" }] },
+			),
+		).toBe("developer");
+	});
+
+	test("Responses input: reads the leading role from input", () => {
+		expect(
+			midSystemRole(
+				model({ api: "openai-responses" }),
+				{
+					input: [
+						{ role: "developer", content: "s" },
+						{ role: "user", content: "u" },
+					],
+				},
+			),
+		).toBe("developer");
+	});
+
+	test("no leading system and no instructions: system", () => {
+		expect(
+			midSystemRole(model(), {
+				messages: [{ role: "user", content: "u" }],
+			}),
+		).toBe("system");
 	});
 });

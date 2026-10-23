@@ -13,11 +13,15 @@
  *    insert {role, content} immediately BEFORE the latest user message.
  *  - OpenAI Responses (payload.input array when messages is absent): same
  *    latest-user-before rule as Chat.
- *  - Anthropic Messages API: the anchor follows the configured role — a
- *    `system` block lands immediately AFTER the latest user turn (Anthropic
- *    requires a mid-conversation system message to follow a user turn, not lead
- *    the array); a `user` block lands before the latest user message like every
- *    other shape. The inserted role is always the configured role.
+ *  - Anthropic Messages API: the anchor follows the role — a `system` block
+ *    lands immediately AFTER the latest user turn (Anthropic requires a
+ *    mid-conversation system message to follow a user turn, not lead the
+ *    array); a `user` block lands before the latest user message like every
+ *    other shape.
+ *
+ * On an OpenAI-family protocol the caller resolves a `system` block to the
+ * identity Pi gives a mid-conversation system message (`system` or
+ * `developer`); `midSystemRole` holds that decision.
  *
  * Every adapter constructs and returns new arrays; nothing is mutated in place.
  * The Anthropic branch is selected when either signal says Anthropic: the
@@ -32,6 +36,9 @@ function findLatestUserIndex(messages: Array<Record<string, unknown>>): number {
 	return messages.findLastIndex((m) => m?.role === "user");
 }
 
+/** The identity a message takes on the provider's wire format. */
+export type WireRole = "system" | "user" | "developer";
+
 /**
  * Return a new array with the tail prompt inserted immediately before the
  * latest user message, or null when there is no user message (the caller then
@@ -40,7 +47,7 @@ function findLatestUserIndex(messages: Array<Record<string, unknown>>): number {
 export function injectTailPrompt(
 	messages: Array<Record<string, unknown>>,
 	content: string,
-	role: "system" | "user",
+	role: WireRole,
 ): Array<Record<string, unknown>> | null {
 	const index = findLatestUserIndex(messages);
 	if (index === -1) return null;
@@ -89,6 +96,65 @@ export function injectAnthropicTail(
 	];
 }
 
+/** The OpenAI-family protocols whose system messages can take the `developer` identity. */
+const OPENAI_PROTOCOLS = new Set([
+	"openai-completions",
+	"openai-responses",
+	"azure-openai-responses",
+	"openai-codex-responses",
+]);
+
+/** What the identity decision reads from the session model. */
+export interface ModelIdentityView {
+	api?: unknown;
+	reasoning?: unknown;
+	compat?: unknown;
+}
+
+function declaredDeveloperRole(model: ModelIdentityView): boolean | undefined {
+	if (typeof model.compat !== "object" || model.compat === null) return undefined;
+	const value = (model.compat as Record<string, unknown>).supportsDeveloperRole;
+	return typeof value === "boolean" ? value : undefined;
+}
+
+/** The identity Pi gave the leading system message, when the payload carries one. */
+function leadingSystemRole(
+	payload: Record<string, unknown>,
+): "system" | "developer" | undefined {
+	for (const field of ["messages", "input"] as const) {
+		const array = payload[field];
+		if (!Array.isArray(array)) continue;
+		const first = array[0] as Record<string, unknown> | undefined;
+		const role = first?.role;
+		if (role === "system" || role === "developer") return role;
+	}
+	return undefined;
+}
+
+/**
+ * The identity Pi gives a mid-conversation system message on this request.
+ *
+ * Pi renders such a message as `developer` on an OpenAI-family protocol when
+ * the model takes reasoning and the provider supports that role. The leading
+ * message carries the choice Pi made; Codex Responses keeps its leading prompt
+ * in `instructions` and falls back to the model capability.
+ */
+export function midSystemRole(
+	model: ModelIdentityView | undefined,
+	payload: Record<string, unknown>,
+): "system" | "developer" {
+	if (!model || typeof model.api !== "string" || !OPENAI_PROTOCOLS.has(model.api)) {
+		return "system";
+	}
+	if (model.reasoning !== true) return "system";
+	const declared = declaredDeveloperRole(model);
+	if (declared !== undefined) return declared ? "developer" : "system";
+	const leading = leadingSystemRole(payload);
+	if (leading !== undefined) return leading;
+	if (typeof payload.instructions === "string") return "developer";
+	return "system";
+}
+
 /**
  * Route a provider payload through the correct tail-injection adapter.
  *
@@ -96,8 +162,8 @@ export function injectAnthropicTail(
  * live event emitter. Returns a new payload, or undefined when nothing should
  * be sent back as a replacement (the handler then leaves the payload untouched).
  *
- * The configured role decides the inserted message's role; the payload shape
- * decides the anchor (the tail placement table in docs_zh-CN/architecture.md):
+ * The wire role decides the inserted message's identity; the payload shape
+ * decides the anchor (the tail placement table in docs/architecture.md):
  * `messages` and `input` lead the latest user message, and the Anthropic
  * Messages shape leads it for `user` and follows the latest user turn for
  * `system`.
@@ -105,14 +171,14 @@ export function injectAnthropicTail(
 export function applyTailToPayload(
 	payload: Record<string, unknown>,
 	content: string,
-	role: "system" | "user",
+	role: WireRole,
 	api?: string,
 ): Record<string, unknown> | undefined {
 	const messages = payload.messages;
 	if (Array.isArray(messages)) {
 		const arr = messages as Array<Record<string, unknown>>;
 		const next = isAnthropicPayload(payload, api)
-			? injectAnthropicTail(arr, content, role)
+			? injectAnthropicTail(arr, content, role === "user" ? "user" : "system")
 			: injectTailPrompt(arr, content, role);
 		if (!next) return undefined;
 		return { ...payload, messages: next };
