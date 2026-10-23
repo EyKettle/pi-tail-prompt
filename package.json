@@ -1,6 +1,6 @@
 {
   "name": "tail-prompt",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "private": true,
   "description": "Pi extension: deliver a configured tail block on every provider request, adjacent to the latest user turn or folded into the leading system prompt",
