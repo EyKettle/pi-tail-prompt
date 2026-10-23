@@ -44,7 +44,7 @@ profiles:
 
 ## `imports`
 
-> [!warning]
+> [!WARNING]
 > 提示词清单中引用的条目必须在此注册，存在缺漏则整块不注入。
 
 ```yaml
